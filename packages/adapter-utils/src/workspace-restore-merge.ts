@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { createReadStream, readFileSync } from "node:fs";
 import { constants as fsConstants, promises as fs } from "node:fs";
 import path from "node:path";
 import { shouldExcludePath } from "./exclude-patterns.js";
@@ -191,6 +191,50 @@ function entriesMatch(left: SnapshotEntry | null | undefined, right: SnapshotEnt
 const LOCK_STALE_MS = 30_000;
 
 /**
+ * Absolute upper bound on how long any directory merge may legitimately hold
+ * the lock. A merge takes seconds, so a lock older than this is a leftover from
+ * a crashed or restarted process. This is only a backstop for owner records
+ * that carry no instance identity (locks written before this field existed);
+ * the instance identity below reclaims a reused PID directly.
+ */
+const LOCK_MAX_AGE_MS = 15 * 60_000;
+
+/**
+ * Reads a process's kernel start time (`/proc/<pid>/stat` field 22, in clock
+ * ticks since boot) and turns it into a stable identity for that process launch.
+ * The start time is fixed for the lifetime of a process and differs for every
+ * new process, so it distinguishes a live owner from an unrelated process that
+ * merely reused its PID after a container restart.
+ *
+ * Returns `null` when `/proc` is unavailable (non-Linux) or unreadable, so the
+ * caller keeps the plain PID-liveness behavior there.
+ */
+function processStartInstanceId(pid: number): string | null {
+  try {
+    const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // Field 2 (`comm`) may contain spaces and parentheses, so anchor the field
+    // split on the final ")" rather than the first space.
+    const close = raw.lastIndexOf(")");
+    if (close < 0) return null;
+    // After `comm`, the next token is field 3, so field 22 is index 22 - 3.
+    const startTime = raw.slice(close + 1).trim().split(/\s+/)[19];
+    return startTime ? `linux-starttime:${startTime}` : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The identity of this server process launch, recorded in `owner.json` beside
+ * the PID. Computed once at module load. On Linux it is the process start time
+ * (see {@link processStartInstanceId}); elsewhere it falls back to a random id,
+ * which still distinguishes this process launch on PID-reuse detection but
+ * cannot validate another PID's identity — that path keeps the PID-liveness
+ * check.
+ */
+const PROCESS_INSTANCE_ID = processStartInstanceId(process.pid) ?? `process:${randomUUID()}`;
+
+/**
  * The stable `code` a lock-timeout error carries, so a caller can identify it
  * without matching on the error message text (the message embeds the lock
  * directory path).
@@ -266,20 +310,10 @@ export function describeWorkspaceRestoreFailure(code: WorkspaceRestoreFailureCod
 }
 
 async function isLockStale(lockDir: string): Promise<boolean> {
+  let owner: { pid?: unknown; instanceId?: unknown; createdAt?: unknown };
   try {
     const raw = await fs.readFile(path.join(lockDir, "owner.json"), "utf8");
-    const owner = JSON.parse(raw) as { pid?: unknown };
-    const pid = typeof owner.pid === "number" && Number.isFinite(owner.pid) && owner.pid > 0 ? owner.pid : null;
-    if (pid === null) {
-      // Owner record is unparseable / missing pid — treat as stale.
-      return true;
-    }
-    try {
-      process.kill(pid, 0);
-      return false;
-    } catch {
-      return true;
-    }
+    owner = JSON.parse(raw) as typeof owner;
   } catch {
     // owner.json is missing or unreadable. A live holder also passes through
     // this exact state, briefly, between its own `fs.mkdir(lockDir)` and its
@@ -291,6 +325,47 @@ async function isLockStale(lockDir: string): Promise<boolean> {
     const stat = await fs.stat(lockDir).catch(() => null);
     return !stat || Date.now() - stat.mtimeMs > LOCK_STALE_MS;
   }
+
+  const pid = typeof owner.pid === "number" && Number.isFinite(owner.pid) && owner.pid > 0 ? owner.pid : null;
+  if (pid === null) {
+    // Owner record is unparseable / missing pid — treat as stale.
+    return true;
+  }
+
+  // PID reuse across a container restart is what this guards: the PID is alive
+  // again but belongs to a different process (in Docker the server is always a
+  // low, fixed PID). When the owner recorded the identity of the process that
+  // wrote the lock, a mismatch proves reuse, so the lock is stale even though
+  // `process.kill(pid, 0)` succeeds. A match for our own PID means the lock is
+  // ours and we are alive; a match for another PID means that PID was not
+  // reused and is a genuine live holder (mutual exclusion preserved).
+  const ownerInstanceId =
+    typeof owner.instanceId === "string" && owner.instanceId.length > 0 ? owner.instanceId : null;
+  if (ownerInstanceId !== null) {
+    if (pid === process.pid) {
+      return ownerInstanceId !== PROCESS_INSTANCE_ID;
+    }
+    const liveInstanceId = processStartInstanceId(pid);
+    if (liveInstanceId !== null) {
+      return liveInstanceId !== ownerInstanceId;
+    }
+  } else {
+    // Legacy owner record with no instance identity. The PID check alone cannot
+    // tell a leftover lock from a live holder whose PID was reused, so fall back
+    // to the absolute age backstop: no merge legitimately holds the lock this
+    // long, so an old record is stale even while its PID still exists.
+    const createdAt = typeof owner.createdAt === "string" ? Date.parse(owner.createdAt) : Number.NaN;
+    if (Number.isFinite(createdAt) && Date.now() - createdAt > LOCK_MAX_AGE_MS) {
+      return true;
+    }
+  }
+
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch {
+    return true;
+  }
 }
 
 async function acquireDirectoryMergeLock(lockDir: string): Promise<() => Promise<void>> {
@@ -300,7 +375,11 @@ async function acquireDirectoryMergeLock(lockDir: string): Promise<() => Promise
       await fs.mkdir(lockDir);
       await fs.writeFile(
         path.join(lockDir, "owner.json"),
-        `${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`,
+        `${JSON.stringify({
+          pid: process.pid,
+          instanceId: PROCESS_INSTANCE_ID,
+          createdAt: new Date().toISOString(),
+        })}\n`,
         "utf8",
       );
       return async () => {
@@ -310,8 +389,10 @@ async function acquireDirectoryMergeLock(lockDir: string): Promise<() => Promise
       const code = error && typeof error === "object" ? (error as { code?: unknown }).code : null;
       if (code !== "EEXIST") throw error;
       // Stale-lock detection: if the owner PID is dead (SIGKILL / OOM / crash),
-      // the lockDir would otherwise persist forever and stall restores. Mirror
-      // the materializePaperclipSkillCopy lock pattern — remove and retry.
+      // or the PID was reused by a different process after a container restart
+      // (the recorded instance identity no longer matches), the lockDir would
+      // otherwise persist forever and stall restores. Mirror the
+      // materializePaperclipSkillCopy lock pattern — remove and retry.
       if (await isLockStale(lockDir)) {
         await fs.rm(lockDir, { recursive: true, force: true }).catch(() => undefined);
         continue;

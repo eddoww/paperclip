@@ -200,11 +200,30 @@ const LOCK_STALE_MS = 30_000;
 const LOCK_MAX_AGE_MS = 15 * 60_000;
 
 /**
+ * The host's boot id (`/proc/sys/kernel/random/boot_id`). The start-time tick
+ * counter restarts at boot, so a host reboot combined with a persistent
+ * workspace volume could let a fresh process reuse the same PID *and* the same
+ * start tick as the dead owner. Prefixing the boot id makes that collision
+ * impossible. `null` when `/proc` is unavailable or the file is unreadable.
+ */
+function readBootId(): string | null {
+  try {
+    const raw = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    return raw.length > 0 ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+const BOOT_ID = readBootId();
+
+/**
  * Reads a process's kernel start time (`/proc/<pid>/stat` field 22, in clock
  * ticks since boot) and turns it into a stable identity for that process launch.
  * The start time is fixed for the lifetime of a process and differs for every
  * new process, so it distinguishes a live owner from an unrelated process that
- * merely reused its PID after a container restart.
+ * merely reused its PID after a container restart. The boot id is included so a
+ * reboot that restarts the tick counter cannot alias a previous launch.
  *
  * Returns `null` when `/proc` is unavailable (non-Linux) or unreadable, so the
  * caller keeps the plain PID-liveness behavior there.
@@ -218,7 +237,7 @@ function processStartInstanceId(pid: number): string | null {
     if (close < 0) return null;
     // After `comm`, the next token is field 3, so field 22 is index 22 - 3.
     const startTime = raw.slice(close + 1).trim().split(/\s+/)[19];
-    return startTime ? `linux-starttime:${startTime}` : null;
+    return startTime ? `linux-starttime:${BOOT_ID ?? "no-boot-id"}:${startTime}` : null;
   } catch {
     return null;
   }
@@ -313,7 +332,13 @@ async function isLockStale(lockDir: string): Promise<boolean> {
   let owner: { pid?: unknown; instanceId?: unknown; createdAt?: unknown };
   try {
     const raw = await fs.readFile(path.join(lockDir, "owner.json"), "utf8");
-    owner = JSON.parse(raw) as typeof owner;
+    const parsed: unknown = JSON.parse(raw);
+    // A corrupted record can parse to a non-object (`null`, a number, a
+    // string). Reading `.pid` on it would throw out of `isLockStale`, so every
+    // acquire would fail immediately and the lock would never reclaim. Such a
+    // record is not a live holder: treat it as stale so the lock self-heals.
+    if (!parsed || typeof parsed !== "object") return true;
+    owner = parsed as typeof owner;
   } catch {
     // owner.json is missing or unreadable. A live holder also passes through
     // this exact state, briefly, between its own `fs.mkdir(lockDir)` and its
@@ -363,8 +388,11 @@ async function isLockStale(lockDir: string): Promise<boolean> {
   try {
     process.kill(pid, 0);
     return false;
-  } catch {
-    return true;
+  } catch (error) {
+    // EPERM means the PID exists but belongs to another user (or `/proc` hides
+    // it from us): the process is alive, so the lock is live. Only an ESRCH-like
+    // failure means the owner is gone.
+    return (error as NodeJS.ErrnoException).code !== "EPERM";
   }
 }
 

@@ -308,20 +308,20 @@ export const vaultProviderConfigSchema = z.object({
   secretPathPrefix: optionalSafeShortText,
 }).strict();
 
-function rejectUnsafeVaultwardenBaseUrl(value: unknown, ctx: z.RefinementCtx) {
+function rejectVaultwardenBaseUrlOverride(value: unknown, ctx: z.RefinementCtx) {
   if (value === undefined || value === null) return;
-  const parsed = vaultAddressSchema.safeParse(value);
-  if (parsed.success) return;
-  for (const issue of parsed.error.issues) {
-    ctx.addIssue({
-      ...issue,
-      path: ["config", "baseUrl", ...issue.path],
-    });
-  }
+  // B2: the instance URL comes from PAPERCLIP_SECRETS_VAULTWARDEN_URL only. A
+  // per-company override could redirect the service-account API key to an
+  // attacker-controlled origin, so it is never accepted.
+  ctx.addIssue({
+    code: z.ZodIssueCode.custom,
+    path: ["config", "baseUrl"],
+    message:
+      "Vaultwarden base URL is fixed by the PAPERCLIP_SECRETS_VAULTWARDEN_URL server environment and cannot be set on a provider vault",
+  });
 }
 
 export const vaultwardenProviderConfigSchema = z.object({
-  baseUrl: vaultAddressSchema.optional().nullable(),
   organizationId: z.string().trim().guid(),
   collectionId: z.string().trim().guid().optional().nullable(),
   itemNamePrefix: optionalSafeShortText,
@@ -383,7 +383,7 @@ export const updateSecretProviderConfigSchema = z.object({
   if (value.config !== undefined) {
     rejectSensitiveProviderConfigKeys(value.config, ctx);
     rejectUnsafeVaultAddress(value.config.address, ctx);
-    rejectUnsafeVaultwardenBaseUrl(value.config.baseUrl, ctx);
+    rejectVaultwardenBaseUrlOverride(value.config.baseUrl, ctx);
   }
   if ((value.status === "coming_soon" || value.status === "disabled") && value.isDefault) {
     ctx.addIssue({

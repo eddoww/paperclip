@@ -101,6 +101,15 @@ export function deriveMasterKey(input: {
   }
 
   if (input.kdf === 0) {
+    // L1: bound the server-supplied parameters so a hostile or compromised
+    // server cannot force a weak derivation.
+    if (input.iterations < 5_000 || input.iterations > 2_000_000) {
+      fail(
+        "invalid_request",
+        "deriveMasterKey",
+        "Vaultwarden PBKDF2 iteration count is outside the supported range.",
+      );
+    }
     return pbkdf2Sync(input.masterPassword, email, input.iterations, MASTER_KEY_LENGTH, "sha256");
   }
 
@@ -115,11 +124,19 @@ export function deriveMasterKey(input: {
     }
     const memoryKib = input.memoryKib ?? 0;
     const parallelism = input.parallelism ?? 0;
-    if (memoryKib <= 0 || parallelism <= 0) {
+    // L1: Argon2id iterations 2..10, memory 15..1024 MiB, parallelism 1..16.
+    if (
+      input.iterations < 2 ||
+      input.iterations > 10 ||
+      memoryKib < 15 * 1024 ||
+      memoryKib > 1024 * 1024 ||
+      parallelism < 1 ||
+      parallelism > 16
+    ) {
       fail(
         "invalid_request",
         "deriveMasterKey",
-        "Vaultwarden Argon2id account is missing KDF memory or parallelism.",
+        "Vaultwarden Argon2id KDF parameters are outside the supported range.",
       );
     }
     try {

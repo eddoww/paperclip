@@ -101,6 +101,39 @@ describe("vaultwarden crypto", () => {
     }
   });
 
+  it("rejects out-of-range server-supplied KDF parameters", () => {
+    expect(() =>
+      deriveMasterKey({
+        kdf: 0,
+        masterPassword: "x",
+        email: "test@example.com",
+        iterations: 1,
+      }),
+    ).toThrowError();
+
+    expect(() =>
+      deriveMasterKey({
+        kdf: 1,
+        masterPassword: "x",
+        email: "test@example.com",
+        iterations: 3,
+        memoryKib: 8 * 1024,
+        parallelism: 4,
+      }),
+    ).toThrowError();
+
+    expect(() =>
+      deriveMasterKey({
+        kdf: 1,
+        masterPassword: "x",
+        email: "test@example.com",
+        iterations: 3,
+        memoryKib: 64 * 1024,
+        parallelism: 64,
+      }),
+    ).toThrowError();
+  });
+
   it("stretches the master key with HKDF-Expand only", () => {
     const masterKey = Buffer.from([...Array(32).keys()]);
     const stretched = stretchMasterKey(masterKey);

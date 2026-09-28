@@ -161,7 +161,6 @@ export interface VaultProviderConfig {
 }
 
 export interface VaultwardenProviderConfig {
-  baseUrl?: string | null;
   organizationId: string;
   collectionId?: string | null;
   itemNamePrefix?: string | null;

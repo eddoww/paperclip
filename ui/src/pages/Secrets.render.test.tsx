@@ -515,7 +515,7 @@ describe("Secrets page layout", () => {
     expect(providerSelect?.value).toBe("vaultwarden");
     expect([...(providerSelect?.options ?? [])].map((option) => option.value)).toContain("vaultwarden");
     expect(document.getElementById("provider-vault-organization-id")).not.toBeNull();
-    expect(document.getElementById("provider-vault-base-url")).not.toBeNull();
+    expect(document.getElementById("provider-vault-base-url")).toBeNull();
 
     await act(async () => {
       root.unmount();

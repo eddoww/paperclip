@@ -49,6 +49,7 @@ export interface VaultwardenCipherField {
 export interface VaultwardenCipher {
   id: string;
   organizationId?: string | null;
+  encryptedFor?: string | null;
   key?: string | null;
   name?: string | null;
   notes?: string | null;
@@ -80,6 +81,10 @@ export interface VaultwardenCipherWrite {
   name: string;
   notes?: string | null;
   organizationId?: string | null;
+  // Vaultwarden 1.37.x requires the owning user id on create and update
+  // (CipherData.encrypted_for); a missing or mismatched value is a 422
+  // "Invalid user cipher".
+  encryptedFor?: string | null;
   key?: string | null;
   login?: VaultwardenCipherLogin | null;
   fields?: VaultwardenCipherField[] | null;
@@ -109,7 +114,6 @@ export interface VaultwardenGateway {
     accessToken: string;
     cipherId: string;
     cipher: VaultwardenCipherWrite;
-    collectionIds: string[];
   }): Promise<VaultwardenCipher>;
   softDeleteCipher(input: { baseUrl: string; accessToken: string; cipherId: string }): Promise<void>;
   hardDeleteCipher(input: { baseUrl: string; accessToken: string; cipherId: string }): Promise<void>;
@@ -194,19 +198,32 @@ export function normalizeVaultwardenError(operation: string, error: unknown): ne
   });
 }
 
-export function decodeJwtEmail(accessToken: string): string | null {
+export function decodeJwtClaims(accessToken: string): Record<string, unknown> | null {
   const parts = accessToken.split(".");
   if (parts.length < 2) return null;
   try {
-    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as {
-      email?: unknown;
-    };
-    return typeof payload.email === "string" && payload.email.trim().length > 0
-      ? payload.email.trim()
-      : null;
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as unknown;
+    return payload && typeof payload === "object" ? (payload as Record<string, unknown>) : null;
   } catch {
     return null;
   }
+}
+
+export function decodeJwtEmail(accessToken: string): string | null {
+  const payload = decodeJwtClaims(accessToken);
+  if (!payload) return null;
+  return typeof payload.email === "string" && payload.email.trim().length > 0
+    ? payload.email.trim()
+    : null;
+}
+
+/** The `sub` claim is the owning Vaultwarden user id that cipher writes must echo as `encryptedFor`. */
+export function decodeJwtSubject(accessToken: string): string | null {
+  const payload = decodeJwtClaims(accessToken);
+  if (!payload) return null;
+  return typeof payload.sub === "string" && payload.sub.trim().length > 0
+    ? payload.sub.trim()
+    : null;
 }
 
 function optionalString(value: unknown): string | null {
@@ -233,6 +250,7 @@ function normalizeCipher(value: unknown): VaultwardenCipher {
   return {
     id: optionalString(record.id) ?? "",
     organizationId: optionalString(record.organizationId),
+    encryptedFor: optionalString(record.encryptedFor),
     key: optionalString(record.key),
     name: optionalString(record.name),
     notes: optionalString(record.notes),
@@ -431,7 +449,6 @@ export class VaultwardenHttpGateway implements VaultwardenGateway {
     accessToken: string;
     cipherId: string;
     cipher: VaultwardenCipherWrite;
-    collectionIds: string[];
   }): Promise<VaultwardenCipher> {
     const { body } = await this.request({
       operation: "updateCipher",
@@ -439,7 +456,10 @@ export class VaultwardenHttpGateway implements VaultwardenGateway {
       init: {
         method: "PUT",
         headers: this.authHeaders(input.accessToken, true),
-        body: JSON.stringify({ cipher: input.cipher, collectionIds: input.collectionIds }),
+        // Vaultwarden 1.37.x takes a flat CipherData on this endpoint. Only
+        // /ciphers/create takes the ShareCipherData { cipher, collectionIds }
+        // wrapper, and only that endpoint accepts collection ids.
+        body: JSON.stringify(input.cipher),
       },
     });
     return normalizeCipher(body);

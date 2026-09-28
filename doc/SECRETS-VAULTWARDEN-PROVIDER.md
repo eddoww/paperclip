@@ -10,7 +10,7 @@ Operational contract for the `vaultwarden` secret provider. The provider connect
 - Vaultwarden bootstrap credentials are deployment/runtime credentials. They are not Paperclip-managed company secrets.
 - Managed mode writes an encrypted login item into a configured organization collection. External-reference mode links an existing item and reads it at runtime.
 - Remote import for existing items is metadata-only. It creates Paperclip external references. It does not copy plaintext into Paperclip.
-- Per-company Vaultwarden provider vaults carry non-sensitive routing metadata only: `baseUrl`, `organizationId`, `collectionId`, and `itemNamePrefix`. They never carry credentials.
+- Per-company Vaultwarden provider vaults carry non-sensitive routing metadata only: `organizationId`, `collectionId`, and `itemNamePrefix`. They never carry credentials. The instance URL is not part of the provider vault config; it comes only from `PAPERCLIP_SECRETS_VAULTWARDEN_URL`.
 
 ## Bootstrap Trust Model
 
@@ -22,11 +22,11 @@ Allowed bootstrap locations:
 - A mode-0600 file mounted into the Paperclip server container or pod. Prefer this path.
 - Local development environment variables for short-lived tests only.
 
-The provider reads each credential once at module init and then deletes the inline environment variable. It keeps the value only in a module-private closure. This scrubbing is mandatory. Local-adapter agents that run as the same OS user can read a `_FILE` mount. Remote execution targets do not inherit the Paperclip server environment or file mounts. The environment variable names are:
+The provider reads and deletes every bootstrap credential eagerly, at provider construction. Because `provider-registry.ts` imports the provider at server boot, the credential keys are scrubbed from `process.env` before any adapter or sandbox probe runs. The values live only in a module-private closure. This scrubbing is mandatory. The `_FILE` mount is the only supported production path; inline environment values are for local development only. Local-adapter agents that run as the same OS user can read a `_FILE` mount. Note that deleting a key from `process.env` does not rewrite the process's initial environment block, so the same-uid `/proc/<pid>/environ` still exposes the startup values for the process lifetime. The environment variable names are:
 
 | Variable | Secret | Notes |
 |---|---|---|
-| `PAPERCLIP_SECRETS_VAULTWARDEN_URL` | no | Default base URL. Use an origin-only `https://` URL. `http://` is allowed only for localhost or development. A provider vault `baseUrl` overrides this value. |
+| `PAPERCLIP_SECRETS_VAULTWARDEN_URL` | no | Instance base URL. Use an origin-only `https://` URL. `http://` is allowed only for localhost or development. A provider vault cannot override this value. |
 | `PAPERCLIP_SECRETS_VAULTWARDEN_CLIENT_ID` | semi | Personal API key id of the service account, in the form `user.<uuid>`. |
 | `PAPERCLIP_SECRETS_VAULTWARDEN_CLIENT_SECRET` | yes | Personal API key secret. |
 | `PAPERCLIP_SECRETS_VAULTWARDEN_MASTER_PASSWORD` | yes | Master password of the service account. The API key only authenticates. The provider needs the master password to derive the keys. |
@@ -46,7 +46,7 @@ Use a dedicated service account. Do not use a human account.
 3. Give the service account access only to the collections that Paperclip must read or write.
 4. Create a personal API key for the service account. Store the client id and the client secret as bootstrap credentials.
 5. Read the organization id and the collection id from the Vaultwarden URLs in the web vault. Both values are UUIDs.
-6. Create a Paperclip provider vault with the `baseUrl`, `organizationId`, `collectionId`, and an optional `itemNamePrefix`.
+6. Create a Paperclip provider vault with the `organizationId`, `collectionId`, and an optional `itemNamePrefix`.
 7. Run `paperclipai doctor`, or the provider health route, and confirm that the provider reports the configured values and no missing variables.
 
 Collection membership is the permission model. The service account can decrypt every item in every collection that it can see. Grant the smallest collection set that the deployment needs.
@@ -76,17 +76,16 @@ Provider vault config, stored in the Paperclip database:
 
 ```json
 {
-  "baseUrl": "https://vault.example.com",
   "organizationId": "11111111-1111-4111-8111-111111111111",
   "collectionId": "22222222-2222-4222-8222-222222222222",
   "itemNamePrefix": "paperclip/"
 }
 ```
 
-- `organizationId` is required and must be a UUID.
-- `collectionId` is optional. When it is absent, the provider uses the organization scope only.
+- `organizationId` is required and must be a UUID. The provider refuses every read, link and write without it, and rejects any item in another organization.
+- `collectionId` is optional. When it is absent, the provider uses the organization scope only. When it is set, linked and resolved items must be members of that collection.
 - `itemNamePrefix` is optional. The provider prefixes managed item names with this value.
-- `baseUrl` is optional and must be an origin-only `http(s)` URL.
+- `baseUrl` is not accepted. The instance URL is fixed by `PAPERCLIP_SECRETS_VAULTWARDEN_URL`. The provider rejects a stored `baseUrl` override at runtime so a pre-existing row cannot redirect the service-account API key.
 
 Managed item name convention:
 
@@ -126,7 +125,7 @@ Paperclip stores no plaintext, no ciphertext, and no keys.
 - `company_secrets`: `provider = 'vaultwarden'`, `externalRef = <cipherUuid>[#field]`, `providerConfigId`, name, and key metadata. No value.
 - `company_secret_versions.material` (jsonb): `{ scheme: "vaultwarden_v1", cipherId, field, organizationId, revisionDate, source: "managed" | "external_reference" }`. No plaintext, no ciphertext, no keys.
 - `valueSha256`: for managed values, the SHA-256 of the value. For external references, the fingerprint of `vaultwarden_v1:<ref>:<revisionDate>`.
-- `company_secret_provider_configs.config` (jsonb): `{ baseUrl?, organizationId, collectionId?, itemNamePrefix? }`. All non-secret.
+- `company_secret_provider_configs.config` (jsonb): `{ organizationId, collectionId?, itemNamePrefix? }`. All non-secret. No `baseUrl`.
 - Error messages and health details never include tokens, the account email, key material, or decrypted names.
 
 ## External Reference Format
@@ -143,8 +142,10 @@ The default selector is `password`. The provider validates the UUID shape and re
 
 Lifecycle rules:
 
+- Every link and resolve enforces `cipher.organizationId === config.organizationId`, the optional collection membership, and `deletedDate == null`. A trashed cipher resolves as not found.
+- An item whose decrypted name starts with the configured `itemNamePrefix` is a Paperclip-managed item. Linking or resolving another company's managed item is rejected.
 - Archive uses a soft delete and leaves the item in the trash.
-- Delete uses a hard delete.
+- Delete uses a hard delete. Before it deletes, it fetches the cipher and requires the configured organization plus a matching managed item name. It never derives the cipher id from an external reference.
 - The provider never deletes the remote item for an external reference. External references are metadata-only.
 
 ## Rotation Runbook
@@ -152,8 +153,8 @@ Lifecycle rules:
 Manual Paperclip-managed rotation:
 
 1. Rotate the value through the Paperclip secret rotate flow.
-2. Paperclip updates the item in place with `PUT /api/ciphers/{id}`.
-3. Paperclip records the new `providerVersionRef` in `company_secret_versions`.
+2. Paperclip creates a new cipher for the new version (`POST /api/ciphers/create`) and records the new `providerVersionRef` and cipher id in `company_secret_versions`. The previous cipher stays referenced by the previous version row.
+3. If the Paperclip database write fails, the rollback archives the new, still-unreferenced cipher and leaves the live value intact.
 4. Restart or re-run the affected workloads that consume `latest`, or pin consumers to a specific Paperclip version before rollout when a staged release is necessary.
 
 Guidance:
@@ -217,14 +218,21 @@ Response steps:
 
 ## Optional Live Smoke
 
-This test is safe to skip locally. Run it only against a dedicated Vaultwarden test account.
+This test is safe to skip locally. Run it only against a dedicated Vaultwarden test account or a disposable container.
+
+The provider test suite includes an opt-in live smoke (`server/src/__tests__/vaultwarden-live-smoke.test.ts`). It is skipped unless `PAPERCLIP_VAULTWARDEN_LIVE_SMOKE=1` is set. Point it at a disposable Vaultwarden 1.37.x instance (for example `docker run --rm -p 8080:80 vaultwarden/server:1.37.3`). It covers create, rotate, resolve and delete, and it writes and deletes real ciphers — never point it at production.
+
+The live smoke reads the bootstrap credentials from the process environment before it imports the provider, because importing the provider scrubs the `PAPERCLIP_SECRETS_VAULTWARDEN_*` keys (B1). It builds the provider vault config from:
+
+- `PAPERCLIP_VAULTWARDEN_LIVE_SMOKE=1`.
+- `PAPERCLIP_VAULTWARDEN_LIVE_SMOKE_ORGANIZATION_ID` (UUID).
+- `PAPERCLIP_VAULTWARDEN_LIVE_SMOKE_COLLECTION_ID` (optional UUID).
+- `PAPERCLIP_SECRETS_VAULTWARDEN_URL`, `_CLIENT_ID`, `_CLIENT_SECRET`, `_MASTER_PASSWORD`.
 
 Prerequisites:
 
-- A throwaway Vaultwarden account with a service account, an organization, and a collection.
-- `PAPERCLIP_VAULTWARDEN_LIVE_SMOKE=1`.
-- All required `PAPERCLIP_SECRETS_VAULTWARDEN_*` variables set.
-- A provider vault that points at the test organization and collection.
+- A throwaway Vaultwarden 1.37.x account with a service account, an organization, and a collection.
+- The environment above set for that disposable instance.
 
 Suggested smoke:
 

@@ -1424,7 +1424,6 @@ export const storybookSecretProviderConfigs: CompanySecretProviderConfig[] = [
     status: "ready",
     isDefault: false,
     config: {
-      baseUrl: "https://vault.example.com",
       organizationId: "11111111-1111-4111-8111-111111111111",
       collectionId: "22222222-2222-4222-8222-222222222222",
       itemNamePrefix: "paperclip/",

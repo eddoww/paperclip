@@ -279,12 +279,11 @@ describe("secret validators", () => {
     ).toThrow();
   });
 
-  it("accepts a Vaultwarden provider vault config with an origin-only base URL", () => {
+  it("accepts a Vaultwarden provider vault config without a base URL", () => {
     expect(
       secretProviderConfigPayloadSchema.parse({
         provider: "vaultwarden",
         config: {
-          baseUrl: " https://vault.edwindejong.net/ ",
           organizationId: "11111111-1111-4111-8111-111111111111",
           collectionId: "22222222-2222-4222-8222-222222222222",
           itemNamePrefix: "paperclip/",
@@ -293,7 +292,6 @@ describe("secret validators", () => {
     ).toEqual({
       provider: "vaultwarden",
       config: {
-        baseUrl: "https://vault.edwindejong.net",
         organizationId: "11111111-1111-4111-8111-111111111111",
         collectionId: "22222222-2222-4222-8222-222222222222",
         itemNamePrefix: "paperclip/",
@@ -310,20 +308,23 @@ describe("secret validators", () => {
     ).not.toThrow();
   });
 
-  it("rejects non-origin Vaultwarden base URLs", () => {
-    for (const baseUrl of [
-      "https://user:pass@vault.example.com",
-      "https://vault.example.com?token=x",
-      "https://vault.example.com/vaultwarden",
-    ]) {
-      expect(() =>
-        createSecretProviderConfigSchema.parse({
-          provider: "vaultwarden",
-          displayName: "Vaultwarden",
-          config: { baseUrl, organizationId: "11111111-1111-4111-8111-111111111111" },
-        }),
-      ).toThrow(/origin-only HTTP\(S\) URL/i);
-    }
+  it("rejects a Vaultwarden base URL override", () => {
+    expect(() =>
+      createSecretProviderConfigSchema.parse({
+        provider: "vaultwarden",
+        displayName: "Vaultwarden",
+        config: {
+          baseUrl: "https://vault.example.com",
+          organizationId: "11111111-1111-4111-8111-111111111111",
+        },
+      }),
+    ).toThrow(/Unrecognized key|fixed by the PAPERCLIP_SECRETS_VAULTWARDEN_URL/i);
+
+    expect(() =>
+      updateSecretProviderConfigSchema.parse({
+        config: { baseUrl: "https://attacker.example" },
+      }),
+    ).toThrow(/PAPERCLIP_SECRETS_VAULTWARDEN_URL/i);
   });
 
   it("rejects sensitive or unknown Vaultwarden provider config keys", () => {

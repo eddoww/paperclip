@@ -8,6 +8,7 @@ import {
   VAULTWARDEN_DEVICE_NAME,
   VaultwardenHttpGateway,
   decodeJwtEmail,
+  decodeJwtSubject,
   normalizeVaultwardenBaseUrl,
   normalizeVaultwardenError,
   type VaultwardenCipher,
@@ -58,6 +59,7 @@ export interface VaultwardenBootstrapCredentials {
   clientSecret: string | null;
   masterPassword: string | null;
   deviceId: string | null;
+  deviceType: number;
 }
 
 export interface VaultwardenProviderOptions {
@@ -85,6 +87,7 @@ interface VaultwardenSession {
   accessToken: string;
   expiresAt: number;
   email: string;
+  userId: string | null;
   userKey: Buffer;
   privateKey: KeyObject | null;
   orgKeys: Map<string, Buffer>;
@@ -115,6 +118,13 @@ function readEnvValue(env: NodeJS.ProcessEnv, key: string): string | null {
   return fileValue || inlineValue || null;
 }
 
+export function parseVaultwardenDeviceType(raw: string | null | undefined): number {
+  const trimmed = raw?.trim();
+  if (!trimmed) return VAULTWARDEN_DEFAULT_DEVICE_TYPE;
+  const parsed = Number(trimmed);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : VAULTWARDEN_DEFAULT_DEVICE_TYPE;
+}
+
 export function loadVaultwardenBootstrapCredentials(
   env: NodeJS.ProcessEnv = process.env,
 ): VaultwardenBootstrapCredentials {
@@ -124,6 +134,7 @@ export function loadVaultwardenBootstrapCredentials(
     clientSecret: readEnvValue(env, VAULTWARDEN_ENV_KEYS.clientSecret),
     masterPassword: readEnvValue(env, VAULTWARDEN_ENV_KEYS.masterPassword),
     deviceId: readEnvValue(env, VAULTWARDEN_ENV_KEYS.deviceId),
+    deviceType: parseVaultwardenDeviceType(readEnvValue(env, VAULTWARDEN_ENV_KEYS.deviceType)),
   };
 }
 
@@ -136,13 +147,6 @@ export function describeVaultwardenBootstrapReadiness(
   if (!credentials.clientSecret) missing.push(VAULTWARDEN_ENV_KEYS.clientSecret);
   if (!credentials.masterPassword) missing.push(VAULTWARDEN_ENV_KEYS.masterPassword);
   return missing;
-}
-
-function resolveDeviceType(env: NodeJS.ProcessEnv): number {
-  const raw = env[VAULTWARDEN_ENV_KEYS.deviceType]?.trim();
-  if (!raw) return VAULTWARDEN_DEFAULT_DEVICE_TYPE;
-  const parsed = Number(raw);
-  return Number.isInteger(parsed) && parsed >= 0 ? parsed : VAULTWARDEN_DEFAULT_DEVICE_TYPE;
 }
 
 /** Derive a stable RFC-4122-looking device identifier from the API key id. */
@@ -203,6 +207,7 @@ export function parseVaultwardenReference(externalRef: string): VaultwardenRefer
 function createExternalReferenceMaterial(
   externalRef: string,
   providerVersionRef: string | null,
+  organizationId: string | null,
 ): PreparedSecretVersion {
   const reference = parseVaultwardenReference(externalRef);
   const normalizedProviderVersionRef = providerVersionRef?.trim() || null;
@@ -214,7 +219,7 @@ function createExternalReferenceMaterial(
       scheme: VAULTWARDEN_SCHEME,
       cipherId: reference.cipherId,
       field: reference.field,
-      organizationId: null,
+      organizationId,
       revisionDate: normalizedProviderVersionRef,
       source: "external_reference",
     },
@@ -419,6 +424,105 @@ function decryptCipherName(cipher: VaultwardenCipher, session: VaultwardenSessio
   }
 }
 
+export function buildVaultwardenManagedItemPrefix(input: {
+  itemNamePrefix: string;
+  companyId: string;
+}): string {
+  return `${input.itemNamePrefix}${input.companyId}/`;
+}
+
+function denyOrThrow(message: string): never {
+  throw new SecretProviderClientError({
+    code: "access_denied",
+    provider: VAULTWARDEN_PROVIDER,
+    operation: "assertCipherAccess",
+    message,
+  });
+}
+
+/**
+ * Enforce the configured-org permission boundary on every cipher read or link.
+ * A service account can decrypt every item in every collection it can see, so
+ * the configured organization, the optional collection and the managed-name
+ * namespace are the only boundaries Paperclip can apply.
+ */
+function assertCipherAccess(input: {
+  cipher: VaultwardenCipher;
+  vault: VaultwardenVaultConfig;
+  session: VaultwardenSession;
+  companyId: string | null | undefined;
+  operation: string;
+}): void {
+  const { cipher, vault, operation } = input;
+  if (!vault.organizationId) {
+    throw new SecretProviderClientError({
+      code: "invalid_request",
+      provider: VAULTWARDEN_PROVIDER,
+      operation,
+      message: "Vaultwarden access requires a configured organizationId.",
+    });
+  }
+  if (!cipher.id) {
+    throw new SecretProviderClientError({
+      code: "not_found",
+      provider: VAULTWARDEN_PROVIDER,
+      operation,
+      message: "Vaultwarden item was not found.",
+    });
+  }
+  if (cipher.deletedDate) {
+    throw new SecretProviderClientError({
+      code: "not_found",
+      provider: VAULTWARDEN_PROVIDER,
+      operation,
+      message: "Vaultwarden item was not found.",
+    });
+  }
+  if (cipher.organizationId !== vault.organizationId) {
+    denyOrThrow("Vaultwarden item does not belong to the configured organization.");
+  }
+  if (vault.collectionId && !(cipher.collectionIds ?? []).includes(vault.collectionId)) {
+    denyOrThrow("Vaultwarden item is not a member of the configured collection.");
+  }
+  if (vault.itemNamePrefix) {
+    const name = decryptCipherName(cipher, input.session);
+    if (name.startsWith(vault.itemNamePrefix)) {
+      const expected = buildVaultwardenManagedItemPrefix({
+        itemNamePrefix: vault.itemNamePrefix,
+        companyId: input.companyId?.trim() ?? "",
+      });
+      if (!input.companyId?.trim() || !name.startsWith(expected)) {
+        denyOrThrow("Vaultwarden item belongs to a different company managed namespace.");
+      }
+    }
+  }
+}
+
+/** Verify that a managed cipher is safe to delete: configured org plus managed name. */
+function assertManagedCipherForDelete(input: {
+  cipher: VaultwardenCipher;
+  vault: VaultwardenVaultConfig;
+  session: VaultwardenSession;
+  companyId: string;
+  operation: string;
+}): void {
+  assertCipherAccess({
+    cipher: input.cipher,
+    vault: input.vault,
+    session: input.session,
+    companyId: input.companyId,
+    operation: input.operation,
+  });
+  const expected = buildVaultwardenManagedItemPrefix({
+    itemNamePrefix: input.vault.itemNamePrefix,
+    companyId: input.companyId,
+  });
+  const name = decryptCipherName(input.cipher, input.session);
+  if (!name.startsWith(expected)) {
+    denyOrThrow("Vaultwarden item does not match the managed item namespace.");
+  }
+}
+
 export function createVaultwardenProvider(
   options?: VaultwardenProviderOptions,
 ): SecretProviderModule {
@@ -433,16 +537,52 @@ export function createVaultwardenProvider(
     return bootstrapCache;
   }
 
+  // B1: read and delete the bootstrap credentials at construction time, not
+  // lazily. `provider-registry.ts` imports this module at server boot, so the
+  // default instance scrubs `process.env` before any adapter or sandbox probe
+  // can copy it into a child process.
+  loadBootstrap();
+
   const sessions = new Map<string, VaultwardenSession>();
   const pendingSessions = new Map<string, Promise<VaultwardenSession>>();
   const runtimeWarnings = new Set<string>();
 
+  function instanceBaseUrl(): string | null {
+    return normalizeVaultwardenBaseUrl(loadBootstrap().baseUrl);
+  }
+
+  function configuredBaseUrlOverride(
+    providerConfig?: SecretProviderVaultRuntimeConfig | null,
+  ): string | null {
+    const configured = providerConfig?.config?.baseUrl;
+    return typeof configured === "string" && configured.trim() !== "" ? configured : null;
+  }
+
+  /**
+   * B2: the instance URL is fixed by the server environment. A per-company
+   * provider vault may not redirect the service-account credentials to another
+   * origin. Existing rows that predate the validation are rejected here too.
+   */
+  function assertBaseUrlOverrideAllowed(
+    providerConfig: SecretProviderVaultRuntimeConfig | null | undefined,
+    operation: string,
+  ): void {
+    const configured = configuredBaseUrlOverride(providerConfig);
+    if (!configured) return;
+    if (normalizeVaultwardenBaseUrl(configured) !== instanceBaseUrl()) {
+      throw new SecretProviderClientError({
+        code: "access_denied",
+        provider: VAULTWARDEN_PROVIDER,
+        operation,
+        message:
+          "Vaultwarden base URL is fixed by the PAPERCLIP_SECRETS_VAULTWARDEN_URL server environment and cannot be overridden by a provider vault.",
+      });
+    }
+  }
+
   function resolveBaseUrl(providerConfig?: SecretProviderVaultRuntimeConfig | null): string | null {
-    const configured =
-      typeof providerConfig?.config?.baseUrl === "string"
-        ? providerConfig.config.baseUrl
-        : null;
-    return normalizeVaultwardenBaseUrl(configured) ?? normalizeVaultwardenBaseUrl(loadBootstrap().baseUrl);
+    assertBaseUrlOverrideAllowed(providerConfig, "resolveConfig");
+    return instanceBaseUrl();
   }
 
   function descriptor() {
@@ -476,8 +616,14 @@ export function createVaultwardenProvider(
         `Vaultwarden bootstrap credentials are incomplete: ${missing.join(", ")}.`,
       );
     }
-    if (!resolveBaseUrl(input?.providerConfig)) {
+    if (!instanceBaseUrl()) {
       warnings.push("Vaultwarden base URL is missing or not a valid origin-only http(s) URL.");
+    }
+    const override = configuredBaseUrlOverride(input?.providerConfig);
+    if (override && normalizeVaultwardenBaseUrl(override) !== instanceBaseUrl()) {
+      warnings.push(
+        "Vaultwarden provider vault baseUrl differs from PAPERCLIP_SECRETS_VAULTWARDEN_URL and is ignored; remove it from the provider vault config.",
+      );
     }
     if (input?.providerConfig) {
       const organizationId = input.providerConfig.config.organizationId;
@@ -499,7 +645,7 @@ export function createVaultwardenProvider(
     const validation = await validateConfig(input);
     const credentials = loadBootstrap();
     const missing = describeVaultwardenBootstrapReadiness(credentials);
-    const baseUrl = resolveBaseUrl(input?.providerConfig);
+    const baseUrl = instanceBaseUrl();
     return {
       provider: VAULTWARDEN_PROVIDER,
       status: missing.length === 0 ? "ok" : "warn",
@@ -517,7 +663,7 @@ export function createVaultwardenProvider(
         clientSecretConfigured: Boolean(credentials.clientSecret),
         masterPasswordConfigured: Boolean(credentials.masterPassword),
         deviceIdConfigured: Boolean(credentials.deviceId),
-        deviceType: resolveDeviceType(env),
+        deviceType: credentials.deviceType,
         missingConfig: missing,
       },
     };
@@ -541,7 +687,7 @@ export function createVaultwardenProvider(
         clientId: credentials.clientId,
         clientSecret: credentials.clientSecret,
         deviceId: credentials.deviceId ?? deriveVaultwardenDeviceId(credentials.clientId),
-        deviceType: resolveDeviceType(env),
+        deviceType: credentials.deviceType,
         deviceName: VAULTWARDEN_DEVICE_NAME,
       })
       .catch((error: unknown) => normalizeVaultwardenError("login", error));
@@ -577,7 +723,9 @@ export function createVaultwardenProvider(
         masterPassword: credentials.masterPassword,
         email,
         iterations: token.kdfIterations,
-        memoryKib: token.kdfMemory,
+        // Vaultwarden returns KdfMemory in MiB (15..1024); Node's argon2Sync
+        // takes `memory` in KiB.
+        memoryKib: token.kdfMemory == null ? null : token.kdfMemory * 1024,
         parallelism: token.kdfParallelism,
       });
       const stretched = stretchMasterKey(masterKey);
@@ -605,8 +753,12 @@ export function createVaultwardenProvider(
       return {
         baseUrl,
         accessToken: token.accessToken,
-        expiresAt: Date.now() + Math.max(token.expiresIn, 60) * 1000 - VAULTWARDEN_SESSION_REFRESH_SKEW_MS,
+        // L5: keep at least 30s of validity, so a short expiresIn cannot make
+        // every call re-login and re-derive the KDF.
+        expiresAt:
+          Date.now() + Math.max(token.expiresIn * 1000 - VAULTWARDEN_SESSION_REFRESH_SKEW_MS, 30_000),
         email,
+        userId: decodeJwtSubject(token.accessToken),
         userKey,
         privateKey,
         orgKeys,
@@ -662,16 +814,28 @@ export function createVaultwardenProvider(
     return baseUrl;
   }
 
-  function requireOrganizationId(vault: VaultwardenVaultConfig): string {
+  function requireOrganizationScope(vault: VaultwardenVaultConfig, operation: string): string {
     if (!vault.organizationId) {
       throw new SecretProviderClientError({
         code: "invalid_request",
         provider: VAULTWARDEN_PROVIDER,
-        operation: "managedWrite",
-        message: "Vaultwarden managed writes require a configured organizationId.",
+        operation,
+        message: "Vaultwarden operations require a configured organizationId.",
       });
     }
     return vault.organizationId;
+  }
+
+  function requireSessionUserId(session: VaultwardenSession, operation: string): string {
+    if (!session.userId) {
+      throw new SecretProviderClientError({
+        code: "invalid_request",
+        provider: VAULTWARDEN_PROVIDER,
+        operation,
+        message: "Vaultwarden did not expose the account user id required for cipher writes.",
+      });
+    }
+    return session.userId;
   }
 
   function requireSessionOrgKey(session: VaultwardenSession, organizationId: string): Buffer {
@@ -699,7 +863,7 @@ export function createVaultwardenProvider(
     async createSecret(input) {
       const vault = readProviderVaultConfig(input.providerConfig);
       const baseUrl = requireBaseUrl(input.providerConfig);
-      const organizationId = requireOrganizationId(vault);
+      const organizationId = requireOrganizationScope(vault, "createSecret");
       const context = requireWriteContext(input.context);
       const name = buildVaultwardenManagedItemName({
         itemNamePrefix: vault.itemNamePrefix,
@@ -710,6 +874,7 @@ export function createVaultwardenProvider(
 
       return withSession(baseUrl, async (session) => {
         const orgKey = requireSessionOrgKey(session, organizationId);
+        const encryptedFor = requireSessionUserId(session, "createSecret");
         const created = await gateway
           .createCipher({
             baseUrl,
@@ -719,6 +884,7 @@ export function createVaultwardenProvider(
               type: VAULTWARDEN_ENTRY_TYPE_LOGIN,
               name: encryptWithKey(name, orgKey),
               organizationId,
+              encryptedFor,
               login: {
                 username: encryptWithKey(context.secretName, orgKey),
                 password: encryptWithKey(input.value, orgKey),
@@ -747,7 +913,7 @@ export function createVaultwardenProvider(
     async createVersion(input) {
       const vault = readProviderVaultConfig(input.providerConfig);
       const baseUrl = requireBaseUrl(input.providerConfig);
-      const organizationId = requireOrganizationId(vault);
+      const organizationId = requireOrganizationScope(vault, "createVersion");
       const context = requireWriteContext(input.context);
       const reference = input.externalRef ? parseVaultwardenReference(input.externalRef) : null;
       if (!reference) {
@@ -767,16 +933,34 @@ export function createVaultwardenProvider(
 
       return withSession(baseUrl, async (session) => {
         const orgKey = requireSessionOrgKey(session, organizationId);
-        const updated = await gateway
-          .updateCipher({
+        const encryptedFor = requireSessionUserId(session, "createVersion");
+        // M3: rotate writes a new cipher per version instead of overwriting the
+        // live one in place. A later failure can then safely archive the new,
+        // still-unreferenced cipher without destroying the live value.
+        const existing = await gateway
+          .getCipher({
             baseUrl,
             accessToken: session.accessToken,
             cipherId: reference.cipherId,
+          })
+          .catch((error: unknown) => normalizeVaultwardenError("getCipher", error));
+        assertCipherAccess({
+          cipher: existing,
+          vault,
+          session,
+          companyId: context.companyId,
+          operation: "createVersion",
+        });
+        const created = await gateway
+          .createCipher({
+            baseUrl,
+            accessToken: session.accessToken,
             collectionIds: vault.collectionId ? [vault.collectionId] : [],
             cipher: {
               type: VAULTWARDEN_ENTRY_TYPE_LOGIN,
               name: encryptWithKey(name, orgKey),
               organizationId,
+              encryptedFor,
               login: {
                 username: encryptWithKey(context.secretName, orgKey),
                 password: encryptWithKey(input.value, orgKey),
@@ -784,10 +968,18 @@ export function createVaultwardenProvider(
               fields: [],
             },
           })
-          .catch((error: unknown) => normalizeVaultwardenError("updateCipher", error));
+          .catch((error: unknown) => normalizeVaultwardenError("createCipher", error));
+        if (!created.id) {
+          throw new SecretProviderClientError({
+            code: "provider_error",
+            provider: VAULTWARDEN_PROVIDER,
+            operation: "createVersion",
+            message: "Vaultwarden did not return a cipher id for the new version.",
+          });
+        }
         return createManagedMaterial({
-          cipherId: updated.id || reference.cipherId,
-          revisionDate: updated.revisionDate ?? null,
+          cipherId: created.id,
+          revisionDate: created.revisionDate ?? null,
           field: "password",
           organizationId,
           valueSha256,
@@ -795,12 +987,40 @@ export function createVaultwardenProvider(
       });
     },
     async linkExternalSecret(input) {
-      return createExternalReferenceMaterial(input.externalRef, input.providerVersionRef ?? null);
+      const vault = readProviderVaultConfig(input.providerConfig);
+      const baseUrl = requireBaseUrl(input.providerConfig);
+      const organizationId = requireOrganizationScope(vault, "linkExternalSecret");
+      const reference = parseVaultwardenReference(input.externalRef);
+      const companyId = input.context?.companyId ?? null;
+      return withSession(baseUrl, async (session) => {
+        const cipher = await gateway
+          .getCipher({
+            baseUrl,
+            accessToken: session.accessToken,
+            cipherId: reference.cipherId,
+          })
+          .catch((error: unknown) => normalizeVaultwardenError("getCipher", error));
+        assertCipherAccess({
+          cipher,
+          vault,
+          session,
+          companyId,
+          operation: "linkExternalSecret",
+        });
+        return createExternalReferenceMaterial(
+          input.externalRef,
+          input.providerVersionRef ?? null,
+          organizationId,
+        );
+      });
     },
     async resolveVersion(input) {
+      const vault = readProviderVaultConfig(input.providerConfig);
       const baseUrl = requireBaseUrl(input.providerConfig);
+      requireOrganizationScope(vault, "resolveVersion");
       const material = asVaultwardenMaterial(input.material);
       const reference = resolveReference({ externalRef: input.externalRef, material });
+      const companyId = input.context?.companyId ?? null;
 
       return withSession(baseUrl, async (session) => {
         const cipher = await gateway
@@ -810,14 +1030,15 @@ export function createVaultwardenProvider(
             cipherId: reference.cipherId,
           })
           .catch((error: unknown) => normalizeVaultwardenError("getCipher", error));
-        if (!cipher.id) {
-          throw new SecretProviderClientError({
-            code: "not_found",
-            provider: VAULTWARDEN_PROVIDER,
-            operation: "resolveVersion",
-            message: "Vaultwarden item was not found.",
-          });
-        }
+        // B3/M3: enforce the configured org, collection and managed namespace,
+        // and treat a trashed cipher as not found, on every resolve.
+        assertCipherAccess({
+          cipher,
+          vault,
+          session,
+          companyId,
+          operation: "resolveVersion",
+        });
         if (
           input.providerVersionRef &&
           cipher.revisionDate &&
@@ -838,6 +1059,7 @@ export function createVaultwardenProvider(
     async listRemoteSecrets(input): Promise<RemoteSecretListResult> {
       const vault = readProviderVaultConfig(input.providerConfig);
       const baseUrl = requireBaseUrl(input.providerConfig);
+      requireOrganizationScope(vault, "listRemoteSecrets");
       const pageSize =
         input.pageSize && Number.isFinite(input.pageSize)
           ? Math.min(Math.max(Math.trunc(input.pageSize), 1), 100)
@@ -875,15 +1097,31 @@ export function createVaultwardenProvider(
     },
     async deleteOrArchive(input) {
       const material = asVaultwardenMaterial(input.material ?? null);
-      // External references are metadata-only: never delete the remote item.
-      if (material?.source === "external_reference") return;
-      const baseUrl = resolveBaseUrl(input.providerConfig);
-      if (!baseUrl) return;
-      const cipherId = material?.cipherId
-        ?? (input.externalRef ? parseVaultwardenReference(input.externalRef).cipherId : null);
+      // M2: only Paperclip-managed material is ever deleted remotely. External
+      // references are metadata-only, and missing or unrecognised material must
+      // never fall through to a hard delete derived from an external ref.
+      if (material?.source !== "managed") return;
+      const vault = readProviderVaultConfig(input.providerConfig);
+      const organizationId = requireOrganizationScope(vault, "deleteOrArchive");
+      const baseUrl = requireBaseUrl(input.providerConfig);
+      const cipherId = material.cipherId;
       if (!cipherId) return;
+      const context = requireWriteContext(input.context);
 
       await withSession(baseUrl, async (session) => {
+        const cipher = await gateway
+          .getCipher({ baseUrl, accessToken: session.accessToken, cipherId })
+          .catch((error: unknown) => normalizeVaultwardenError("getCipher", error));
+        if (cipher.organizationId !== organizationId) {
+          denyOrThrow("Vaultwarden item does not belong to the configured organization.");
+        }
+        assertManagedCipherForDelete({
+          cipher,
+          vault,
+          session,
+          companyId: context.companyId,
+          operation: "deleteOrArchive",
+        });
         if (input.mode === "archive") {
           await gateway
             .softDeleteCipher({ baseUrl, accessToken: session.accessToken, cipherId })

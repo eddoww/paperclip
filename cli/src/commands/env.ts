@@ -37,7 +37,7 @@ const VAULTWARDEN_ENV_SPECS: { key: string; sensitive: boolean; required: boolea
     key: "PAPERCLIP_SECRETS_VAULTWARDEN_URL",
     sensitive: false,
     required: true,
-    note: "Default Vaultwarden base URL (origin-only http(s)); provider vault config overrides it",
+    note: "Vaultwarden instance base URL (origin-only http(s)); provider vault config cannot override it",
   },
   {
     key: "PAPERCLIP_SECRETS_VAULTWARDEN_CLIENT_ID",

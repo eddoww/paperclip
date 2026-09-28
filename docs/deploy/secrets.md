@@ -365,14 +365,14 @@ can override) the deployment-level `PAPERCLIP_SECRETS_AWS_*` env. Bootstrap
 credentials still come from the AWS SDK default credential chain — see
 `doc/SECRETS-AWS-PROVIDER.md` for the full IAM and KMS contract.
 
-**Vaultwarden / Bitwarden vaults** read the per-vault `baseUrl`,
-`organizationId`, `collectionId`, and `itemNamePrefix` to route managed writes
-and external-reference reads. `organizationId` is required. The vault config
-supplements (and can override) the deployment-level
-`PAPERCLIP_SECRETS_VAULTWARDEN_URL`. Bootstrap credentials still come from the
-server runtime environment or `_FILE` mounts — see
-`doc/SECRETS-VAULTWARDEN-PROVIDER.md` for the full account, crypto, and
-collection-membership contract. A `vaultwarden` vault defaults to `ready`.
+**Vaultwarden / Bitwarden vaults** read the per-vault `organizationId`,
+`collectionId`, and `itemNamePrefix` to route managed writes and
+external-reference reads. `organizationId` is required, and every read, link
+and write is scoped to it. The instance URL comes only from the deployment-level
+`PAPERCLIP_SECRETS_VAULTWARDEN_URL`; a per-vault `baseUrl` override is rejected.
+Bootstrap credentials still come from the server runtime environment or `_FILE`
+mounts — see `doc/SECRETS-VAULTWARDEN-PROVIDER.md` for the full account, crypto,
+and collection-membership contract. A `vaultwarden` vault defaults to `ready`.
 
 **GCP Secret Manager** and **HashiCorp Vault** vaults are coming soon. You can
 save draft `projectId`, `location`, `namespace`, `address`, and `mountPath`
@@ -466,7 +466,7 @@ Each provider family has a different backup story:
   user-scoped values. The full restore checklist lives in
   `doc/SECRETS-AWS-PROVIDER.md`.
 - `vaultwarden`: back up Paperclip's database for vault metadata (vault id,
-  base URL, organization id, collection id, prefix, default flag, bindings,
+  organization id, collection id, prefix, default flag, bindings,
   version pointers, user-secret definitions/declarations, owner ids, and
   access-event metadata). The actual secret values live in the Vaultwarden
   account. Restore by pointing the same Paperclip company at the same

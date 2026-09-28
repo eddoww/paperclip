@@ -221,9 +221,9 @@ Per-provider `config` shapes:
 - `local_encrypted`: optional `backupReminderAcknowledged: boolean`.
 - `aws_secrets_manager`: required `region`; optional `namespace`,
   `secretNamePrefix`, `kmsKeyId`, `ownerTag`, `environmentTag`.
-- `vaultwarden`: required UUID `organizationId`; optional origin-only
-  `baseUrl`, UUID `collectionId`, and `itemNamePrefix`. `baseUrl` values with
-  embedded credentials, paths, query strings, or fragments are rejected.
+- `vaultwarden`: required UUID `organizationId`; optional UUID `collectionId`
+  and `itemNamePrefix`. `baseUrl` is rejected; the instance URL comes only from
+  `PAPERCLIP_SECRETS_VAULTWARDEN_URL`.
 - `gcp_secret_manager` (coming soon): optional `projectId`, `location`,
   `namespace`, `secretNamePrefix`.
 - `vault` (coming soon): optional origin-only HTTPS `address`, `namespace`,
@@ -310,9 +310,10 @@ expected AWS SDK credential source; coming-soon vaults always return
 `status: "coming_soon"` with `code: "runtime_locked"` and never call into
 provider modules.
 
-For `vaultwarden`, `details` reports presence booleans for the base URL, client
-id, client secret, master password, and device id, plus the missing variable
-names and the resolved device type. It never returns the values themselves.
+For `vaultwarden`, `details` reports presence booleans for the instance base
+URL, client id, client secret, master password, and device id, plus the missing
+variable names and the resolved device type. It never returns the values
+themselves.
 
 ### Selecting A Vault When Creating Or Rotating Secrets
 

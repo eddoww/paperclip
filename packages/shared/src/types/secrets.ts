@@ -160,11 +160,19 @@ export interface VaultProviderConfig {
   secretPathPrefix?: string | null;
 }
 
+export interface VaultwardenProviderConfig {
+  baseUrl?: string | null;
+  organizationId: string;
+  collectionId?: string | null;
+  itemNamePrefix?: string | null;
+}
+
 export type SecretProviderConfigPayload =
   | LocalEncryptedProviderConfig
   | AwsSecretsManagerProviderConfig
   | GcpSecretManagerProviderConfig
-  | VaultProviderConfig;
+  | VaultProviderConfig
+  | VaultwardenProviderConfig;
 
 export interface SecretProviderConfigHealthDetails {
   code: string;

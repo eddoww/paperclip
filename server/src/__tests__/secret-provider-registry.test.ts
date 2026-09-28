@@ -43,6 +43,13 @@ describe("secret provider registry", () => {
           supportsExternalReferences: true,
           configured: false,
         }),
+        expect.objectContaining({
+          id: "vaultwarden",
+          supportsManagedValues: true,
+          supportsExternalReferences: true,
+          supportsExternalValueWrites: false,
+          configured: false,
+        }),
       ]),
     );
   });

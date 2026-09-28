@@ -137,6 +137,15 @@ const providers: SecretProviderDescriptor[] = [
     supportsExternalReferences: true,
     configured: false,
   },
+  {
+    id: "vaultwarden",
+    label: "Vaultwarden / Bitwarden",
+    requiresExternalRef: false,
+    supportsManagedValues: true,
+    supportsExternalReferences: true,
+    supportsExternalValueWrites: false,
+    configured: true,
+  },
 ];
 
 const providerConfigs = [
@@ -455,6 +464,61 @@ describe("Secrets page layout", () => {
 
     await act(async () => {
       vaultRoot.unmount();
+    });
+  });
+
+  it("shows Vaultwarden as a selectable provider vault, not coming soon", async () => {
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <MemoryRouter>
+          <QueryClientProvider client={queryClient}>
+            <Secrets />
+          </QueryClientProvider>
+        </MemoryRouter>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    const vaultTabButton = [...document.querySelectorAll("button")].find(
+      (button) => button.textContent?.includes("Provider vaults"),
+    ) as HTMLButtonElement | undefined;
+    await act(async () => {
+      vaultTabButton?.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+      vaultTabButton?.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter" }));
+      vaultTabButton?.click();
+    });
+    await flushReact();
+
+    const vaultwardenSection = document.getElementById("provider-vaults-vaultwarden");
+    expect(vaultwardenSection).not.toBeNull();
+    expect(vaultwardenSection?.textContent).toContain("Vaultwarden / Bitwarden");
+    expect(vaultwardenSection?.textContent).not.toContain("Coming soon");
+
+    const addVaultButton = [...(vaultwardenSection?.querySelectorAll("button") ?? [])].find(
+      (button) => button.textContent?.includes("Add vault"),
+    ) as HTMLButtonElement | undefined;
+    expect(addVaultButton).not.toBeUndefined();
+
+    await act(async () => {
+      addVaultButton?.click();
+    });
+    await flushReact();
+
+    const providerSelect = document.getElementById("vault-provider") as HTMLSelectElement | null;
+    expect(providerSelect).not.toBeNull();
+    expect(providerSelect?.value).toBe("vaultwarden");
+    expect([...(providerSelect?.options ?? [])].map((option) => option.value)).toContain("vaultwarden");
+    expect(document.getElementById("provider-vault-organization-id")).not.toBeNull();
+    expect(document.getElementById("provider-vault-base-url")).not.toBeNull();
+
+    await act(async () => {
+      root.unmount();
     });
   });
 

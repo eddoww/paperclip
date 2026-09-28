@@ -180,6 +180,10 @@ type ProviderVaultForm = {
   address: string;
   mountPath: string;
   secretPathPrefix: string;
+  baseUrl: string;
+  organizationId: string;
+  collectionId: string;
+  itemNamePrefix: string;
 };
 
 type SafeProviderErrorDetails = {
@@ -204,6 +208,7 @@ const EMPTY_PROVIDER_CONFIGS: CompanySecretProviderConfig[] = [];
 const PROVIDER_ORDER: SecretProvider[] = [
   "local_encrypted",
   "aws_secrets_manager",
+  "vaultwarden",
   "gcp_secret_manager",
   "vault",
 ];
@@ -230,6 +235,10 @@ function emptyProviderVaultForm(provider: SecretProvider = "local_encrypted"): P
     address: "",
     mountPath: "",
     secretPathPrefix: "",
+    baseUrl: "",
+    organizationId: "",
+    collectionId: "",
+    itemNamePrefix: "",
   };
 }
 
@@ -286,6 +295,10 @@ function providerVaultFormFromConfig(config: CompanySecretProviderConfig): Provi
     address: providerConfigValue(config.config, "address"),
     mountPath: providerConfigValue(config.config, "mountPath"),
     secretPathPrefix: providerConfigValue(config.config, "secretPathPrefix"),
+    baseUrl: providerConfigValue(config.config, "baseUrl"),
+    organizationId: providerConfigValue(config.config, "organizationId"),
+    collectionId: providerConfigValue(config.config, "collectionId"),
+    itemNamePrefix: providerConfigValue(config.config, "itemNamePrefix"),
   };
 }
 
@@ -605,6 +618,13 @@ function buildProviderVaultConfig(form: ProviderVaultForm): Record<string, unkno
         kmsKeyId: compact(form.kmsKeyId),
         ownerTag: compact(form.ownerTag),
         environmentTag: compact(form.environmentTag),
+      };
+    case "vaultwarden":
+      return {
+        baseUrl: compact(form.baseUrl),
+        organizationId: form.organizationId.trim(),
+        collectionId: compact(form.collectionId),
+        itemNamePrefix: compact(form.itemNamePrefix),
       };
     case "gcp_secret_manager":
       return {
@@ -3055,7 +3075,8 @@ export function Secrets() {
               disabled={
                 saveVaultMutation.isPending ||
                 !vaultForm.displayName.trim() ||
-                (vaultForm.provider === "aws_secrets_manager" && !vaultForm.region.trim())
+                (vaultForm.provider === "aws_secrets_manager" && !vaultForm.region.trim()) ||
+                (vaultForm.provider === "vaultwarden" && !vaultForm.organizationId.trim())
               }
             >
               {saveVaultMutation.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1" /> : null}
@@ -3438,6 +3459,8 @@ function providerFamilyIcon(provider: SecretProvider) {
       return Database;
     case "aws_secrets_manager":
       return Cloud;
+    case "vaultwarden":
+      return Lock;
     case "gcp_secret_manager":
       return ShieldCheck;
     case "vault":
@@ -3792,6 +3815,17 @@ function ProviderVaultFields({
         <TextField label="KMS key id" value={form.kmsKeyId} onChange={(value) => setField("kmsKeyId", value)} placeholder="alias/paperclip-secrets" />
         <TextField label="Owner tag" value={form.ownerTag} onChange={(value) => setField("ownerTag", value)} placeholder="platform" />
         <TextField label="Environment tag" value={form.environmentTag} onChange={(value) => setField("environmentTag", value)} placeholder="prod" />
+      </div>
+    );
+  }
+
+  if (form.provider === "vaultwarden") {
+    return (
+      <div className="grid gap-3 sm:grid-cols-2">
+        <TextField label="Base URL" value={form.baseUrl} onChange={(value) => setField("baseUrl", value)} placeholder="https://vault.example.com" />
+        <TextField label="Organization id" value={form.organizationId} onChange={(value) => setField("organizationId", value)} placeholder="00000000-0000-0000-0000-000000000000" required />
+        <TextField label="Collection id" value={form.collectionId} onChange={(value) => setField("collectionId", value)} placeholder="00000000-0000-0000-0000-000000000000" />
+        <TextField label="Item name prefix" value={form.itemNamePrefix} onChange={(value) => setField("itemNamePrefix", value)} placeholder="paperclip/" />
       </div>
     );
   }

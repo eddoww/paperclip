@@ -44,6 +44,11 @@ export async function promptSecrets(current?: SecretsConfig): Promise<SecretsCon
         label: "HashiCorp Vault",
         hint: "requires external adapter integration",
       },
+      {
+        value: "vaultwarden" as const,
+        label: "Vaultwarden / Bitwarden",
+        hint: "requires a Vaultwarden service account and bootstrap credentials on the server runtime",
+      },
     ],
     initialValue: base.provider,
   });
@@ -85,12 +90,13 @@ export async function promptSecrets(current?: SecretsConfig): Promise<SecretsCon
   }
 
   if (provider !== "local_encrypted") {
-    p.note(
+    const note =
       provider === "aws_secrets_manager"
         ? "AWS credentials must come from the Paperclip server runtime (IAM role/workload identity, AWS_PROFILE/SSO/shared credentials, or short-lived shell env), not from Paperclip company secrets."
-        : `${provider} is not fully wired in this build yet. Keep local_encrypted unless you are actively implementing that adapter.`,
-      "Heads up",
-    );
+        : provider === "vaultwarden"
+          ? "Vaultwarden bootstrap credentials (URL, API key id and secret, master password) must come from the Paperclip server runtime as *_FILE mounts or environment variables, not from Paperclip company secrets. Run `paperclipai doctor` to check them."
+          : `${provider} is not fully wired in this build yet. Keep local_encrypted unless you are actively implementing that adapter.`;
+    p.note(note, "Heads up");
   }
 
   return {

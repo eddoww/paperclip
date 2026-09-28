@@ -142,6 +142,20 @@ describe("secrets CLI helpers", () => {
     delete process.env.AWS_ACCESS_KEY_ID;
     delete process.env.AWS_SECRET_ACCESS_KEY;
     delete process.env.AWS_SESSION_TOKEN;
+    for (const key of [
+      "PAPERCLIP_SECRETS_VAULTWARDEN_URL",
+      "PAPERCLIP_SECRETS_VAULTWARDEN_URL_FILE",
+      "PAPERCLIP_SECRETS_VAULTWARDEN_CLIENT_ID",
+      "PAPERCLIP_SECRETS_VAULTWARDEN_CLIENT_ID_FILE",
+      "PAPERCLIP_SECRETS_VAULTWARDEN_CLIENT_SECRET",
+      "PAPERCLIP_SECRETS_VAULTWARDEN_CLIENT_SECRET_FILE",
+      "PAPERCLIP_SECRETS_VAULTWARDEN_MASTER_PASSWORD",
+      "PAPERCLIP_SECRETS_VAULTWARDEN_MASTER_PASSWORD_FILE",
+      "PAPERCLIP_SECRETS_VAULTWARDEN_DEVICE_ID",
+      "PAPERCLIP_SECRETS_VAULTWARDEN_DEVICE_TYPE",
+    ]) {
+      delete process.env[key];
+    }
   });
 
   afterEach(() => {
@@ -261,6 +275,42 @@ describe("secrets CLI helpers", () => {
     expect(result.status).toBe("pass");
     expect(result.message).toContain("prod-us-1");
     expect(result.message).toContain("AWS_PROFILE/shared config");
+  });
+
+  it("reports missing Vaultwarden bootstrap variables without printing values", () => {
+    process.env.PAPERCLIP_SECRETS_VAULTWARDEN_CLIENT_SECRET = "sentinel-client-secret";
+    process.env.PAPERCLIP_SECRETS_VAULTWARDEN_MASTER_PASSWORD_FILE = "/run/secrets/vaultwarden-master";
+
+    const result = secretsCheck(configWithSecretsProvider("vaultwarden"));
+
+    expect(result.status).toBe("fail");
+    expect(result.message).toContain("PAPERCLIP_SECRETS_VAULTWARDEN_URL=missing");
+    expect(result.message).toContain("PAPERCLIP_SECRETS_VAULTWARDEN_CLIENT_ID=missing");
+    expect(result.message).toContain("PAPERCLIP_SECRETS_VAULTWARDEN_CLIENT_SECRET=environment");
+    expect(result.message).toContain("PAPERCLIP_SECRETS_VAULTWARDEN_MASTER_PASSWORD=file");
+    expect(result.repairHint).toContain("_FILE");
+    expect(result.message).not.toContain("sentinel-client-secret");
+    expect(result.message).not.toContain("/run/secrets/vaultwarden-master");
+  });
+
+  it("passes Vaultwarden doctor checks when bootstrap variables are present", () => {
+    process.env.PAPERCLIP_SECRETS_VAULTWARDEN_URL = "https://vault.example.com";
+    process.env.PAPERCLIP_SECRETS_VAULTWARDEN_CLIENT_ID = "user.1234";
+    process.env.PAPERCLIP_SECRETS_VAULTWARDEN_CLIENT_SECRET_FILE = "/run/secrets/vaultwarden-client-secret";
+    process.env.PAPERCLIP_SECRETS_VAULTWARDEN_MASTER_PASSWORD = "sentinel-master-password";
+
+    const result = secretsCheck(configWithSecretsProvider("vaultwarden"));
+
+    expect(result.status).toBe("pass");
+    expect(result.message).toContain("PAPERCLIP_SECRETS_VAULTWARDEN_URL=environment");
+    expect(result.message).toContain("PAPERCLIP_SECRETS_VAULTWARDEN_CLIENT_ID=environment");
+    expect(result.message).toContain("PAPERCLIP_SECRETS_VAULTWARDEN_CLIENT_SECRET=file");
+    expect(result.message).toContain("PAPERCLIP_SECRETS_VAULTWARDEN_MASTER_PASSWORD=environment");
+    expect(result.message).toContain("PAPERCLIP_SECRETS_VAULTWARDEN_DEVICE_ID=missing");
+    expect(result.message).not.toContain("sentinel-master-password");
+    expect(result.message).not.toContain("vault.example.com");
+    expect(result.message).not.toContain("user.1234");
+    expect(result.message).not.toContain("/run/secrets/vaultwarden-client-secret");
   });
 });
 

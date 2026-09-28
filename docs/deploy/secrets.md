@@ -109,6 +109,11 @@ User-scoped values can use the same provider families as company secrets:
 - `aws_secrets_manager`: the hosted/provider-vault path. Use it when the
   deployment already relies on AWS Secrets Manager, KMS, CloudTrail, and
   infrastructure IAM for custody.
+- `vaultwarden`: the self-hosted password-manager path. Use it when a
+  Vaultwarden or Bitwarden account is the source of truth and a dedicated
+  service account can decrypt a scoped organization collection. Bootstrap
+  credentials come from the server runtime, not from Paperclip secrets. See
+  `doc/SECRETS-VAULTWARDEN-PROVIDER.md`.
 - Dedicated provider vaults: optional. Use a dedicated vault only when you need
   a separate AWS account, Region, KMS key, prefix, retention posture, or
   import boundary for user-owned values. Do not create one vault per user by
@@ -234,10 +239,10 @@ using `managedMode: "external_reference"` plus a provider `externalRef`.
 Paperclip stores metadata and a non-sensitive fingerprint, never the value.
 Runtime resolution remains server-side and binding-enforced.
 
-The built-in AWS, GCP, and Vault provider IDs currently accept external
-reference metadata, but runtime resolution requires provider configuration in the
-deployment. Their provider health check reports this as a warning until
-configured.
+The built-in AWS, Vaultwarden, GCP, and Vault provider IDs currently accept
+external reference metadata, but runtime resolution requires provider
+configuration in the deployment. Their provider health check reports this as a
+warning until configured.
 
 For hosted Paperclip Cloud on AWS, see the AWS Secrets Manager operational
 contract — required env vars, IAM/KMS scoping, naming and tag conventions, and
@@ -302,6 +307,10 @@ those providers (and surfaces them on the vault list), but secret create,
 rotate, and resolve calls that target a coming-soon vault fail with a clear
 runtime-locked error.
 
+`vaultwarden` is not coming soon. It ships with a working read path, managed
+writes, and a scoped collection model, so a `vaultwarden` vault defaults to
+`ready` and is selectable for create, rotate, and resolve.
+
 ### Default Vault Behavior
 
 A company can mark **one** ready (or warning) vault per provider family as the
@@ -355,6 +364,15 @@ managed writes and external-reference reads. The vault config supplements (and
 can override) the deployment-level `PAPERCLIP_SECRETS_AWS_*` env. Bootstrap
 credentials still come from the AWS SDK default credential chain — see
 `doc/SECRETS-AWS-PROVIDER.md` for the full IAM and KMS contract.
+
+**Vaultwarden / Bitwarden vaults** read the per-vault `baseUrl`,
+`organizationId`, `collectionId`, and `itemNamePrefix` to route managed writes
+and external-reference reads. `organizationId` is required. The vault config
+supplements (and can override) the deployment-level
+`PAPERCLIP_SECRETS_VAULTWARDEN_URL`. Bootstrap credentials still come from the
+server runtime environment or `_FILE` mounts — see
+`doc/SECRETS-VAULTWARDEN-PROVIDER.md` for the full account, crypto, and
+collection-membership contract. A `vaultwarden` vault defaults to `ready`.
 
 **GCP Secret Manager** and **HashiCorp Vault** vaults are coming soon. You can
 save draft `projectId`, `location`, `namespace`, `address`, and `mountPath`
@@ -447,6 +465,14 @@ Each provider family has a different backup story:
   role still has `GetSecretValue` plus KMS decrypt for both managed and linked
   user-scoped values. The full restore checklist lives in
   `doc/SECRETS-AWS-PROVIDER.md`.
+- `vaultwarden`: back up Paperclip's database for vault metadata (vault id,
+  base URL, organization id, collection id, prefix, default flag, bindings,
+  version pointers, user-secret definitions/declarations, owner ids, and
+  access-event metadata). The actual secret values live in the Vaultwarden
+  account. Restore by pointing the same Paperclip company at the same
+  Vaultwarden account and collection, and confirm the service account still
+  has read and write access. The full restore checklist lives in
+  `doc/SECRETS-VAULTWARDEN-PROVIDER.md`.
 - `gcp_secret_manager` and `vault`: while these are coming soon, only the
   draft vault config exists in Paperclip. Database backups capture it. There
   is nothing to restore on the provider side until runtime support lands.

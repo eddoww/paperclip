@@ -298,6 +298,7 @@ import {
   splitNativePublicationText,
 } from "./chat-publication-text-parts.js";
 import {
+  isStoredDiscordCommandRegistrationDeferred,
   readRegisteredDiscordCommandRegistration,
   reconcileStoredDiscordCommandRegistration,
 } from "./chat-discord-command-registration-store.js";
@@ -7665,6 +7666,21 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   ): Promise<void> {
     const initial = await endpointRecord(endpointId);
     if (!initial || initial.endpoint.provider !== "discord") return;
+    if (
+      initial.endpoint.botExternalId &&
+      initial.endpoint.providerAccountId &&
+      (await isStoredDiscordCommandRegistrationDeferred(
+        db,
+        {
+          companyId: initial.endpoint.companyId,
+          endpointId,
+          applicationId: initial.endpoint.botExternalId,
+          guildId: initial.endpoint.providerAccountId,
+        },
+        force,
+      ))
+    )
+      return;
     const reconcile = async (lease: CredentialMutationLeaseGuard) => {
       const record = await endpointRecord(endpointId);
       if (

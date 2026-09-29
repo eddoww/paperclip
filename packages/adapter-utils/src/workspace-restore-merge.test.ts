@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promises as fsPromises } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
@@ -10,6 +11,7 @@ import { resolvePaperclipInstanceRootForAdapter } from "./server-utils.js";
 import {
   captureDirectorySnapshot,
   directorySnapshotSha256,
+  disposeDirectorySnapshot,
   classifyWorkspaceRestoreFailure,
   describeWorkspaceRestoreFailure,
   mergeDirectoryWithBaseline,
@@ -41,6 +43,7 @@ describe("workspace restore merge", () => {
 
     const snapshot = await captureDirectorySnapshot(rootDir, { exclude: [] });
     const serialized = serializeDirectorySnapshot(snapshot);
+    if (serialized.version !== 1) throw new Error("Expected legacy in-memory snapshot");
     const restored = parseDirectorySnapshot(serialized);
 
     expect(serialized.entries.map(([relativePath]) => relativePath)).toEqual([
@@ -101,6 +104,24 @@ describe("workspace restore merge", () => {
     await expect(
       readFile(path.join(targetDir, "manual-qa", "environment-matrix", "ssh", "codex_local.md"), "utf8"),
     ).resolves.toBe("ssh codex\n");
+  });
+
+  it("preserves a host file replacing a deleted baseline directory and continues the restore", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-conflict-"));
+    cleanupDirs.push(rootDir);
+    const targetDir = path.join(rootDir, "target");
+    const sourceDir = path.join(rootDir, "source");
+    await mkdir(path.join(targetDir, "replaced", "nested"), { recursive: true });
+    await mkdir(sourceDir);
+    const baseline = await captureDirectorySnapshot(targetDir, { exclude: [], diskBacked: true });
+    try {
+      await rm(path.join(targetDir, "replaced"), { recursive: true });
+      await writeFile(path.join(targetDir, "replaced"), "host change");
+      await writeFile(path.join(sourceDir, "other.txt"), "sandbox change");
+      await mergeDirectoryWithBaseline({ baseline, sourceDir, targetDir });
+      expect(await readFile(path.join(targetDir, "replaced"), "utf8")).toBe("host change");
+      expect(await readFile(path.join(targetDir, "other.txt"), "utf8")).toBe("sandbox change");
+    } finally { await disposeDirectorySnapshot(baseline); }
   });
 
   it("ignores non-file entries when capturing snapshots", async () => {
@@ -385,17 +406,30 @@ describe("workspace restore merge", () => {
       const targetDir = path.join(rootDir, "target");
       await mkdir(targetDir, { recursive: true });
 
-      // Pre-create the lock directory a live process holds, so `isLockStale`
+      // Pre-create the lock directory a live holder owns, so `isLockStale`
       // never reports it stale and the retry loop can only leave through the
-      // deadline check. The owner pid is this test process, which stays alive.
+      // deadline check. Capture this process's own instance identity from a
+      // real acquisition, then hand it to the held lock: the PID is this test
+      // process and the identity matches, so the lock is unambiguously live.
       const canonicalTargetDir = await realpath(targetDir);
       const lockKey = createHash("sha256").update(canonicalTargetDir).digest("hex");
       const lockRootDir = path.join(paperclipHome, "instances", "test-instance", "locks", "directory-merge");
       const heldLockDir = path.join(lockRootDir, `${lockKey}.lock`);
+
+      let ownInstanceId = "";
+      await withDirectoryMergeLock(targetDir, async () => {
+        const [lockName] = await readdir(lockRootDir);
+        const owner = JSON.parse(
+          await readFile(path.join(lockRootDir, String(lockName), "owner.json"), "utf8"),
+        ) as { instanceId?: unknown };
+        ownInstanceId = typeof owner.instanceId === "string" ? owner.instanceId : "";
+      });
+      expect(ownInstanceId).not.toBe("");
+
       await mkdir(heldLockDir, { recursive: true });
       await writeFile(
         path.join(heldLockDir, "owner.json"),
-        `${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`,
+        `${JSON.stringify({ pid: process.pid, instanceId: ownInstanceId, createdAt: new Date().toISOString() })}\n`,
         "utf8",
       );
 
@@ -425,6 +459,209 @@ describe("workspace restore merge", () => {
       expect(caughtError?.message).not.toContain("restore_lock_timeout");
       expect(classifyWorkspaceRestoreFailure(caughtError)).toBe("restore_lock_timeout");
     });
+
+    it("reclaims a lock whose PID is alive but whose recorded instance identity is foreign (PID reuse after restart)", async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-merge-"));
+      cleanupDirs.push(rootDir);
+      const paperclipHome = path.join(rootDir, "paperclip-home");
+      useTempPaperclipHome(paperclipHome, "test-instance");
+
+      const targetDir = path.join(rootDir, "target");
+      await mkdir(targetDir, { recursive: true });
+
+      const canonicalTargetDir = await realpath(targetDir);
+      const lockKey = createHash("sha256").update(canonicalTargetDir).digest("hex");
+      const lockRootDir = path.join(paperclipHome, "instances", "test-instance", "locks", "directory-merge");
+      const heldLockDir = path.join(lockRootDir, `${lockKey}.lock`);
+      await mkdir(heldLockDir, { recursive: true });
+      // The owner PID is this live test process, so a PID-liveness check alone
+      // would never reclaim the lock. The recorded identity differs from this
+      // process's own, which is the post-container-restart PID-reuse shape (the
+      // server is PID 7 again, but it is a different process).
+      await writeFile(
+        path.join(heldLockDir, "owner.json"),
+        `${JSON.stringify({ pid: process.pid, instanceId: "foreign-instance", createdAt: new Date().toISOString() })}\n`,
+        "utf8",
+      );
+
+      await expect(
+        withDirectoryMergeLock(targetDir, async (canonical) => canonical),
+      ).resolves.toBe(canonicalTargetDir);
+      await expect(readdir(lockRootDir)).resolves.toHaveLength(0);
+    });
+
+    it("reclaims a lock whose owner PID is no longer alive", async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-merge-"));
+      cleanupDirs.push(rootDir);
+      const paperclipHome = path.join(rootDir, "paperclip-home");
+      useTempPaperclipHome(paperclipHome, "test-instance");
+
+      const targetDir = path.join(rootDir, "target");
+      await mkdir(targetDir, { recursive: true });
+
+      // A child that has already exited: its PID is dead and has been reaped,
+      // so `process.kill(pid, 0)` reports ESRCH.
+      const exited = spawnSync(process.execPath, ["-e", ""]);
+      const deadPid = exited.pid;
+      expect(deadPid).toBeTypeOf("number");
+
+      const canonicalTargetDir = await realpath(targetDir);
+      const lockKey = createHash("sha256").update(canonicalTargetDir).digest("hex");
+      const lockRootDir = path.join(paperclipHome, "instances", "test-instance", "locks", "directory-merge");
+      const heldLockDir = path.join(lockRootDir, `${lockKey}.lock`);
+      await mkdir(heldLockDir, { recursive: true });
+      await writeFile(
+        path.join(heldLockDir, "owner.json"),
+        `${JSON.stringify({
+          pid: deadPid,
+          instanceId: "linux-starttime:0",
+          createdAt: new Date().toISOString(),
+        })}\n`,
+        "utf8",
+      );
+
+      await expect(
+        withDirectoryMergeLock(targetDir, async (canonical) => canonical),
+      ).resolves.toBe(canonicalTargetDir);
+    });
+
+    it("reclaims a legacy owner record past the absolute max age even though its PID is alive", async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-merge-"));
+      cleanupDirs.push(rootDir);
+      const paperclipHome = path.join(rootDir, "paperclip-home");
+      useTempPaperclipHome(paperclipHome, "test-instance");
+
+      const targetDir = path.join(rootDir, "target");
+      await mkdir(targetDir, { recursive: true });
+
+      const canonicalTargetDir = await realpath(targetDir);
+      const lockKey = createHash("sha256").update(canonicalTargetDir).digest("hex");
+      const lockRootDir = path.join(paperclipHome, "instances", "test-instance", "locks", "directory-merge");
+      const heldLockDir = path.join(lockRootDir, `${lockKey}.lock`);
+      await mkdir(heldLockDir, { recursive: true });
+      // The exact incident shape: a pre-fix `owner.json` with no instance
+      // identity, whose PID now belongs to this live process (PID reuse across
+      // a restart). The age backstop is the only thing that can free it.
+      await writeFile(
+        path.join(heldLockDir, "owner.json"),
+        `${JSON.stringify({
+          pid: process.pid,
+          createdAt: new Date(Date.now() - 20 * 60_000).toISOString(),
+        })}\n`,
+        "utf8",
+      );
+
+      await expect(
+        withDirectoryMergeLock(targetDir, async (canonical) => canonical),
+      ).resolves.toBe(canonicalTargetDir);
+    });
+
+    it("reclaims a lock whose owner.json is a non-object so a corrupt record cannot stall acquires", async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-merge-"));
+      cleanupDirs.push(rootDir);
+      const paperclipHome = path.join(rootDir, "paperclip-home");
+      useTempPaperclipHome(paperclipHome, "test-instance");
+
+      const targetDir = path.join(rootDir, "target");
+      await mkdir(targetDir, { recursive: true });
+
+      const canonicalTargetDir = await realpath(targetDir);
+      const lockKey = createHash("sha256").update(canonicalTargetDir).digest("hex");
+      const lockRootDir = path.join(paperclipHome, "instances", "test-instance", "locks", "directory-merge");
+      const heldLockDir = path.join(lockRootDir, `${lockKey}.lock`);
+      await mkdir(heldLockDir, { recursive: true });
+      // `null` (and other non-object JSON shapes) parse successfully, so they
+      // never reach the read-error mtime fallback. Without an explicit guard,
+      // reading `.pid` on them throws out of `isLockStale` and every acquire
+      // fails instead of reclaiming the corrupt lock.
+      await writeFile(path.join(heldLockDir, "owner.json"), "null\n", "utf8");
+
+      await expect(
+        withDirectoryMergeLock(targetDir, async (canonical) => canonical),
+      ).resolves.toBe(canonicalTargetDir);
+      await expect(readdir(lockRootDir)).resolves.toHaveLength(0);
+    });
+
+    it("treats a foreign owner PID that cannot be signalled (EPERM) as alive, not stale", async () => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-merge-"));
+      cleanupDirs.push(rootDir);
+      const paperclipHome = path.join(rootDir, "paperclip-home");
+      useTempPaperclipHome(paperclipHome, "test-instance");
+
+      const targetDir = path.join(rootDir, "target");
+      await mkdir(targetDir, { recursive: true });
+
+      const canonicalTargetDir = await realpath(targetDir);
+      const lockKey = createHash("sha256").update(canonicalTargetDir).digest("hex");
+      const lockRootDir = path.join(paperclipHome, "instances", "test-instance", "locks", "directory-merge");
+      const heldLockDir = path.join(lockRootDir, `${lockKey}.lock`);
+      await mkdir(heldLockDir, { recursive: true });
+      // A legacy record with no instance identity and a fresh timestamp, so
+      // neither the instance-id branch nor the age backstop reclaims it and
+      // liveness falls through to `process.kill`. EPERM means the process
+      // exists but we may not signal it (another user's PID, or `/proc` hidden),
+      // so the lock must stay held.
+      await writeFile(
+        path.join(heldLockDir, "owner.json"),
+        `${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`,
+        "utf8",
+      );
+
+      const eperm: NodeJS.ErrnoException = new Error("Operation not permitted");
+      eperm.code = "EPERM";
+      const killSpy = vi.spyOn(process, "kill").mockImplementation(() => {
+        throw eperm;
+      });
+      // Reach the real deadline without a real 30-second wait: the first
+      // `Date.now()` call computes the deadline, and every call after reports a
+      // time just past it, so the retry loop throws through its deadline check.
+      // The mocked time stays inside the 15-minute age backstop, so this record
+      // is judged live by age and only the EPERM outcome can free it (which it
+      // must not).
+      const realNow = Date.now();
+      const dateNowSpy = vi
+        .spyOn(Date, "now")
+        .mockImplementationOnce(() => realNow)
+        .mockImplementation(() => realNow + 31_000);
+      let caughtError: NodeJS.ErrnoException | undefined;
+      try {
+        await withDirectoryMergeLock(targetDir, async () => undefined);
+      } catch (error) {
+        caughtError = error as NodeJS.ErrnoException;
+      } finally {
+        killSpy.mockRestore();
+        dateNowSpy.mockRestore();
+      }
+
+      expect(caughtError?.code).toBe(WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE);
+    });
+
+    it.skipIf(process.platform !== "linux")(
+      "records the host boot id in the instance identity so a reboot cannot alias a previous launch",
+      async () => {
+        const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-restore-merge-"));
+        cleanupDirs.push(rootDir);
+        const paperclipHome = path.join(rootDir, "paperclip-home");
+        useTempPaperclipHome(paperclipHome, "test-instance");
+
+        const targetDir = path.join(rootDir, "target");
+        await mkdir(targetDir, { recursive: true });
+
+        const lockRootDir = path.join(paperclipHome, "instances", "test-instance", "locks", "directory-merge");
+        let instanceId = "";
+        await withDirectoryMergeLock(targetDir, async () => {
+          const [lockName] = await readdir(lockRootDir);
+          const owner = JSON.parse(
+            await readFile(path.join(lockRootDir, String(lockName), "owner.json"), "utf8"),
+          ) as { instanceId?: unknown };
+          instanceId = typeof owner.instanceId === "string" ? owner.instanceId : "";
+        });
+
+        const bootId = (await readFile("/proc/sys/kernel/random/boot_id", "utf8").catch(() => "")).trim();
+        expect(bootId).not.toBe("");
+        expect(instanceId).toContain(bootId);
+      },
+    );
 
     it.skipIf(process.platform === "win32")(
       "serializes two concurrent writers that address one target through different aliases",

@@ -257,3 +257,14 @@ cleanup must preserve the original candidate as a conflict. The browser reviews
 current and incoming files and applies the run edits against the reviewed current
 directory hash. All three tasks' runs count toward billing and teardown. The suite
 is explicit-only. No private control-plane hooks or direct database writes are used.
+
+## Direct blocker fixtures
+
+`blocker-cases.ts`, `blocker-fixtures.ts`, `blocker-flow.ts`, and
+`blocker-scoring.ts` define the explicit local legacy `blocker-guidance` suite.
+Its fixture registry creates a manager through the public API and assigns the
+production operational skill to worker and manager. Company-wide evidence and
+cleanup include unexpected manager runs. The grader checks saved human input,
+requester identity for scope questions, ownership history, no additional work or
+hires, and the browser-answer continuation. See [Direct blocker guidance](README.md#direct-blocker-guidance)
+for coverage boundaries and run commands.

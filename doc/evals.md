@@ -90,6 +90,10 @@ authentication respectively. Keep their results separate; the subscription
 fixture seeds an explicitly supplied login and does not qualify interactive
 login. See the [Grok fixture contract](../tests/runner-e2e/README.md#grok-build-qualification).
 
+The explicit [Direct blocker guidance suite](../tests/runner-e2e/README.md#direct-blocker-guidance)
+checks the legacy coordination skill against human authority, missing hiring
+permission, and requester scope decisions through saved browser interactions.
+
 ## Validation ladder
 
 Start with credential-free checks and a catalog listing. For Product E2E:

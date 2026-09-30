@@ -1,3 +1,6 @@
+import { TaskBrowserFooter } from "@/components/task-side-panel/TaskBrowserFooter";
+import { TaskBrowserActivity } from "@/components/task-side-panel/TaskBrowserActivity";
+import type { TaskBrowser } from "@paperclipai/shared";
 import { DispositionRecoveryNotice } from "../components/DispositionRecoveryNotice";
 import { CloudSignIn } from "../components/CloudSignIn";
 import { CloudAccessError } from "../components/CloudAccessGate";
@@ -6,6 +9,7 @@ import { MediaArtifactCard } from "@/components/artifacts/MediaArtifactCard";
 import { WebhookUrlWarning } from "@/components/routine-triggers/WebhookUrlWarning";
 import { SetupWizardNavigation, SetupWizardFooter } from "../components/SetupWizard";
 import { RemoteMcpDesignExample } from "@/features/connections/remote-mcp/RemoteMcpDesignExample";
+import { AgentConversationSidebar } from "@/components/AgentConversationSidebar";
 import { AgentChatPicker } from "@/components/AgentChatPicker";
 import { TaskChatProjectCreatedCard } from "@/components/task-chat/TaskChatProjectCreatedCard";
 import { TextAttachmentPreview } from "@/components/task-side-panel/TaskAttachmentPanel";
@@ -1703,6 +1707,13 @@ export function DesignGuide() {
         </SubSection>
         <SubSection title="Agent chat picker">
           <AgentChatPickerExample />
+          <SubSection title="Agent conversation sidebar">
+            <div className="flex flex-wrap gap-4">
+              <div className="h-96 w-60"><AgentConversationSidebar agents={[]} onSelect={() => {}} onBrowse={() => {}} /></div>
+              <div className="h-96 w-60"><AgentConversationSidebar agents={[]} loading /></div>
+              <div className="h-96 w-60"><AgentConversationSidebar agents={[]} error={new Error("Unavailable")} onRetry={() => {}} /></div>
+            </div>
+          </SubSection>
         </SubSection>
         <SubSection title="Sidebar nav items">
           <p className="text-sm text-muted-foreground">
@@ -2394,6 +2405,40 @@ export function DesignGuide() {
         <SubSection title="Access check failed">
           <CloudAccessError temporary={false} retrying={false} onRetry={() => undefined} />
         </SubSection>
+      </Section>
+
+      <Section title="Browser session footer">
+        <p className="text-sm text-muted-foreground">Fit to pane follows the visible panel. Fixed viewport presets and session actions live in the footer menu. Costs stay in task reporting. The idle countdown appears only in the final five minutes. Full panel, activity, and settings states are in Storybook under Browser Use.</p>
+        {(["running", "idle", "closing-soon", "closed"] as const).map((state) => (
+          <SubSection key={state} title={state === "closing-soon" ? "Closing soon" : state}>
+            <TaskBrowserFooter
+              browser={{
+                id: "design-browser", sessionId: "design-session", issueId: "design-task",
+                status: state === "closing-soon" ? "idle" : state,
+                runStatus: "completed", progress: null, error: null, costCents: 15,
+                idleDeadline: new Date(state === "closing-soon" ? 282000 : 600000).toISOString(),
+                expiresAt: null, createdAt: new Date(0).toISOString(),
+              } satisfies TaskBrowser}
+              now={0}
+              onControl={() => {}}
+              onReconnect={() => {}}
+              onResize={() => {}}
+            />
+          </SubSection>
+        ))}
+      </Section>
+
+      <Section title="Browser activity in the task feed">
+        <p className="text-sm text-muted-foreground">Each browser appears once at its opening time among the task messages. Its status updates in place; the action opens its side-panel tab.</p>
+        {(["starting", "running", "idle", "closed", "failed"] as const).map((status) => (
+          <SubSection key={status} title={status}>
+            <TaskBrowserActivity browser={{
+              id: `design-${status}`, sessionId: `design-${status}`, issueId: "design-task", status,
+              runStatus: "completed", progress: null, error: null, costCents: 0,
+              idleDeadline: null, expiresAt: null, createdAt: new Date(0).toISOString(),
+            }} onOpen={() => {}} />
+          </SubSection>
+        ))}
       </Section>
 
       <Section title="Media artifacts">

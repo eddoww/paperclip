@@ -3416,25 +3416,36 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
               eq(secretAccessEvents.consumerId, f.endpoint.connectionId),
             ),
           );
+      // Rows carry no stable order, so compare per-path counts instead of slicing.
+      const countsByPath = async () => {
+        const counts: Record<string, number> = {};
+        for (const row of await accessRows()) {
+          counts[row.configPath] = (counts[row.configPath] ?? 0) + 1;
+        }
+        return counts;
+      };
       try {
         await f.configure();
-        const baseline = (await accessRows()).length;
+        const baseline = await countsByPath();
         for (let tick = 0; tick < 10; tick += 1) {
           await f.service.reconcileProviderRuntimes();
         }
-        expect((await accessRows()).length).toBe(baseline);
+        expect(await countsByPath()).toEqual(baseline);
         expect(f.calls).toEqual(["GET", "POST"]);
         await f.makeDue();
         await f.service.reconcileProviderRuntimes();
         for (let tick = 0; tick < 10; tick += 1) {
           await f.service.reconcileProviderRuntimes();
         }
-        const afterDue = (await accessRows()).slice(baseline);
-        expect(afterDue.map((row) => row.configPath).sort()).toEqual([
-          "credentials.applicationId",
-          "credentials.botToken",
-          "credentials.guildId",
-        ]);
+        const after = await countsByPath();
+        const added = Object.fromEntries(
+          Object.keys(after).map((path) => [path, after[path] - (baseline[path] ?? 0)]),
+        );
+        expect(added).toEqual({
+          "credentials.applicationId": 1,
+          "credentials.botToken": 1,
+          "credentials.guildId": 1,
+        });
         expect(f.calls).toEqual(["GET", "POST", "GET"]);
       } finally {
         await retireRegistrationFixture(f.service, f.endpoint.id);

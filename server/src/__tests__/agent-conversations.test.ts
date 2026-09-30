@@ -219,6 +219,15 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(resolved.every((response) => response.status === 200)).toBe(true);
       expect(resolved[0].body.id).toBe(resolved[1].body.id);
       expect(resolved[0].body.conversationUserId).toBe(owner);
+      const listPath = `/api/companies/${companyId}/chats`;
+      const owned = await request(app).get(listPath);
+      expect(owned.status).toBe(200);
+      expect(owned.body.map((chat: { id: string }) => chat.id)).toEqual([resolved[0].body.id]);
+      expect((await request(appFor(colleague)).get(listPath)).body).toEqual([]);
+      expect((await request(appFor(randomUUID(), false)).get(listPath)).status).toBe(403);
+      await instanceSettingsService(db).updateExperimental({ enableAgentChat: false });
+      expect((await request(app).get(listPath)).status).toBe(404);
+      await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
       expect(
         (
           await request(appFor(colleague)).get(

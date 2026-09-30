@@ -1049,7 +1049,19 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     try {
       await Promise.all([...fixtureServices].map((service) => service.shutdown()));
     } finally {
-      await retireFixtureState([...fixtureCompanies]);
+      const companyIds = [...fixtureCompanies];
+      await retireFixtureState(companyIds);
+      if (companyIds.length > 0) {
+        // Pausing an endpoint does not remove its rows from global recovery
+        // selectors. After every assertion and worker shutdown, settle leftover
+        // fixture work so later cases cannot claim its leases or retry its I/O.
+        await db.update(chatActions).set({ status: "cancelled" })
+          .where(and(inArray(chatActions.companyId, companyIds), notInArray(chatActions.status, ["processed", "cancelled"])));
+        await db.update(chatDeliveries).set({ state: "failed", nextAttemptAt: null })
+          .where(and(inArray(chatDeliveries.companyId, companyIds), inArray(chatDeliveries.state, ["received", "processing", "retry"])));
+        await db.update(chatPublications).set({ state: "cancelled", nextAttemptAt: null })
+          .where(and(inArray(chatPublications.companyId, companyIds), inArray(chatPublications.state, ["pending", "awaiting_consent", "streaming", "retry"])));
+      }
       fixtureServices.clear();
       fixtureCompanies.clear();
     }
@@ -3404,25 +3416,36 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
               eq(secretAccessEvents.consumerId, f.endpoint.connectionId),
             ),
           );
+      // Rows carry no stable order, so compare per-path counts instead of slicing.
+      const countsByPath = async () => {
+        const counts: Record<string, number> = {};
+        for (const row of await accessRows()) {
+          counts[row.configPath] = (counts[row.configPath] ?? 0) + 1;
+        }
+        return counts;
+      };
       try {
         await f.configure();
-        const baseline = (await accessRows()).length;
+        const baseline = await countsByPath();
         for (let tick = 0; tick < 10; tick += 1) {
           await f.service.reconcileProviderRuntimes();
         }
-        expect((await accessRows()).length).toBe(baseline);
+        expect(await countsByPath()).toEqual(baseline);
         expect(f.calls).toEqual(["GET", "POST"]);
         await f.makeDue();
         await f.service.reconcileProviderRuntimes();
         for (let tick = 0; tick < 10; tick += 1) {
           await f.service.reconcileProviderRuntimes();
         }
-        const afterDue = (await accessRows()).slice(baseline);
-        expect(afterDue.map((row) => row.configPath).sort()).toEqual([
-          "credentials.applicationId",
-          "credentials.botToken",
-          "credentials.guildId",
-        ]);
+        const after = await countsByPath();
+        const added = Object.fromEntries(
+          Object.keys(after).map((path) => [path, after[path] - (baseline[path] ?? 0)]),
+        );
+        expect(added).toEqual({
+          "credentials.applicationId": 1,
+          "credentials.botToken": 1,
+          "credentials.guildId": 1,
+        });
         expect(f.calls).toEqual(["GET", "POST", "GET"]);
       } finally {
         await retireRegistrationFixture(f.service, f.endpoint.id);

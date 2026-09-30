@@ -100,6 +100,17 @@ pnpm build-storybook
 
 These run the `@paperclipai/ui` Storybook on port `6006` and build the static output to `ui/storybook-static/`.
 
+Use **Design explorations → Agent chat sidebar** to review the production secondary
+agent navigation. **Components** covers selection, search, loading, empty results,
+and larger teams. **Pages** puts it beside the production agent chat inside the
+real app shell, including landing, conversation, plan panel, light, and mobile
+views. The plus button opens the existing agent picker; adding an agent creates
+one sidebar entry, and choosing them again reopens the same conversation. The
+**Add and reopen** component story exercises that constraint. Agent selection
+and sending use local fixtures. The live `/chats` and `/chats/:agentRef` routes
+use the same sidebar, picker, landing page, and existing chat surface when the
+Agent Chat experimental setting is enabled.
+
 Use **Chat & Comments → Issue Thread Interactions → Composer Questions Auto Advance**
 to try the paged composer form. A single selection shows a brief checked-state animation before advancing to the
 next question. Reduced-motion mode advances without animation.
@@ -115,6 +126,19 @@ pending card.
 Use **Composer → Model and effort picker** to review harness-specific model
 choices. Codex uses the curated adapter catalog unless the instance declares
 `PAPERCLIP_ADAPTER_MODELS`; general OpenAI API models are not Codex choices.
+The Paperclip Runner Codex profile shows the same known model effort levels.
+Its selected effort is saved with the run and sent to Codex for each turn.
+Claude Code uses model-specific effort levels; Haiku has no effort slider.
+Grok uses its adapter's reasoning levels, including for its default model.
+Kimi shows effort only when its agent uses the CLI engine, including with its
+default model, because the default ACP engine ignores effort.
+
+Mobile entity picker sheets use a modal popover so touch scrolling stays inside
+the sheet even when it is portalled outside the new-task dialog. Run
+`pnpm exec playwright test --config tests/e2e/playwright.config.ts tests/e2e/new-task-picker-touch.spec.ts`
+to verify native touch scrolling and selection in both assignee and model lists.
+The test uses a fixed model catalog and a reduced viewport to cover limited
+space while the phone keyboard is open; it does not require a provider login.
 
 The Storybook visual regression suite uses external PNG baselines instead of
 committed screenshots:
@@ -237,6 +261,17 @@ lockfile changes remain local to the worktree; the repository's lockfile bot
 owns committed updates.
 
 ## Hot-Restart Deploys
+
+During a restart, the board's health, session, and access checks retry temporary
+network/gateway failures and non-JSON API responses every five seconds. A new
+page shows **Reconnecting to Paperclip** with a **Try again** action and waits
+for startup health to become ready. Valid startup metadata remains available to
+sign-in and invitation pages. An already
+open page stays mounted during temporary background failures so unsaved edits
+survive. Successful checks resume the same route and refresh other failed reads;
+this recovery does not reload the browser or replay mutations. Authorization
+failures still require sign-in or an explicit retry. Storybook **App / Connection
+recovery** shows the startup recovery states.
 
 Primary-instance rebuilds that restart `paperclip.service` can request one-shot live-run adoption instead of using the normal graceful shutdown drain. Before restarting the service, write the marker from the newly staged app with the current service PID:
 

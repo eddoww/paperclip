@@ -84,6 +84,7 @@ import {
   nativeRunFinalizations,
   environmentLeases,
   principalPermissionGrants,
+  secretAccessEvents,
   toolConnections,
 } from "@paperclipai/db";
 import type { ChatProvider } from "@paperclipai/shared";
@@ -3386,6 +3387,43 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         );
         await f.service.reconcileProviderRuntimes();
         expect(f.calls).toEqual(["GET", "POST"]);
+      } finally {
+        await retireRegistrationFixture(f.service, f.endpoint.id);
+      }
+    });
+
+    it("does not re-resolve Discord credentials on periodic reconciliation until registration is due", async () => {
+      const f = await registrationFixture();
+      const accessRows = async () =>
+        db
+          .select({ configPath: secretAccessEvents.configPath })
+          .from(secretAccessEvents)
+          .where(
+            and(
+              eq(secretAccessEvents.consumerType, "tool_connection"),
+              eq(secretAccessEvents.consumerId, f.endpoint.connectionId),
+            ),
+          );
+      try {
+        await f.configure();
+        const baseline = (await accessRows()).length;
+        for (let tick = 0; tick < 10; tick += 1) {
+          await f.service.reconcileProviderRuntimes();
+        }
+        expect((await accessRows()).length).toBe(baseline);
+        expect(f.calls).toEqual(["GET", "POST"]);
+        await f.makeDue();
+        await f.service.reconcileProviderRuntimes();
+        for (let tick = 0; tick < 10; tick += 1) {
+          await f.service.reconcileProviderRuntimes();
+        }
+        const afterDue = (await accessRows()).slice(baseline);
+        expect(afterDue.map((row) => row.configPath).sort()).toEqual([
+          "credentials.applicationId",
+          "credentials.botToken",
+          "credentials.guildId",
+        ]);
+        expect(f.calls).toEqual(["GET", "POST", "GET"]);
       } finally {
         await retireRegistrationFixture(f.service, f.endpoint.id);
       }

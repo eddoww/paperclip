@@ -136,6 +136,39 @@ export async function readRegisteredDiscordCommandRegistration(
     : null;
 }
 
+function registrationDeferred(
+  current: NonNullable<Awaited<ReturnType<typeof stored>>>,
+  force: boolean | undefined,
+): boolean | null {
+  const result = current.row.result;
+  const due =
+    result?.schema === resultSchema && typeof result.retryAt === "string"
+      ? Date.parse(result.retryAt)
+      : NaN;
+  if (!Number.isFinite(due)) return null;
+  return (
+    result?.retryIndefinite === true ||
+    (due > Date.now() &&
+      !(
+        force === true &&
+        current.state.phase === "registered" &&
+        result?.outcome === "registered"
+      ))
+  );
+}
+
+/** Unlocked, read-only pre-check so periodic reconciliation can skip resolving
+ * provider credentials (and writing secret access audit rows) while the stored
+ * registration is not due. The locked reconcile remains authoritative. */
+export async function isStoredDiscordCommandRegistrationDeferred(
+  database: Database,
+  scope: DiscordCommandRegistrationScope,
+  force?: boolean,
+): Promise<boolean> {
+  const current = await stored(database, scope, false, true);
+  return current ? registrationDeferred(current, force) === true : false;
+}
+
 export async function reconcileStoredDiscordCommandRegistration(
   db: Db,
   options: StoredDiscordCommandRegistrationOptions,
@@ -208,23 +241,9 @@ export async function reconcileStoredDiscordCommandRegistration(
       }
       const current = await stored(tx, scope, true, true);
       if (!current) deny(); // In particular, never recreate an orphaned action.
-      const result = current.row.result;
-      const due =
-        result?.schema === resultSchema && typeof result.retryAt === "string"
-          ? Date.parse(result.retryAt)
-          : NaN;
-      if (!Number.isFinite(due)) deny();
-      return {
-        state: current.state,
-        deferred:
-          result?.retryIndefinite === true ||
-          (due > Date.now() &&
-            !(
-              force === true &&
-              current.state.phase === "registered" &&
-              result?.outcome === "registered"
-            )),
-      };
+      const deferred = registrationDeferred(current, force);
+      if (deferred === null) deny();
+      return { state: current.state, deferred };
     });
     state = initial.state;
     if (initial.deferred) return { kind: "deferred" };

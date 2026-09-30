@@ -1,7 +1,8 @@
-import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { createReadStream, readFileSync } from "node:fs";
 import { constants as fsConstants, promises as fs } from "node:fs";
 import path from "node:path";
+import { createWorkspaceManifest, WorkspaceManifestMap, workspacePathMatcher, type PathManifest, type WorkspacePaths, type WorkspaceManifestWriter } from "./workspace-manifest.js";
 import { shouldExcludePath } from "./exclude-patterns.js";
 import { resolvePaperclipInstanceRootForAdapter } from "./server-utils.js";
 
@@ -12,13 +13,42 @@ export type SnapshotEntry =
 
 export interface DirectorySnapshot {
   exclude: string[];
-  entries: Map<string, SnapshotEntry>;
+  entries: Map<string, SnapshotEntry> | WorkspaceManifestMap<SnapshotEntry>;
+  ignoredPaths?: WorkspacePaths;
 }
 
-export interface SerializedDirectorySnapshot {
+export interface LegacySerializedDirectorySnapshot {
   version: 1;
   exclude: string[];
   entries: Array<[string, SnapshotEntry]>;
+}
+
+export type SerializedDirectorySnapshot = LegacySerializedDirectorySnapshot | {
+  version: 2;
+  exclude: string[];
+  entries: PathManifest;
+  ignoredPaths?: WorkspacePaths;
+};
+const ownedDirectorySnapshots = new WeakMap<DirectorySnapshot, string>();
+export async function disposeDirectorySnapshot(snapshot: DirectorySnapshot | null): Promise<void> {
+  if (!snapshot) return;
+  if (snapshot.entries instanceof WorkspaceManifestMap) {
+    snapshot.entries.close();
+    const ownedDirectory = ownedDirectorySnapshots.get(snapshot);
+    ownedDirectorySnapshots.delete(snapshot);
+    if (ownedDirectory) await fs.rm(ownedDirectory, { recursive: true, force: true });
+  }
+}
+
+function parseManifestEntry(value: string): SnapshotEntry {
+  const result = parseSnapshotEntry(JSON.parse(value));
+  if (!result) throw new Error("Invalid workspace baseline entry");
+  return result;
+}
+
+/** Call only after the controller validates a persisted manifest's path and digest. */
+export function openDirectorySnapshot(value: Extract<SerializedDirectorySnapshot, { version: 2 }>): DirectorySnapshot {
+  return { exclude: value.exclude, entries: new WorkspaceManifestMap(value.entries, parseManifestEntry), ignoredPaths: value.ignoredPaths };
 }
 
 function isSafeSnapshotRelativePath(value: string): boolean {
@@ -51,6 +81,10 @@ function parseSnapshotEntry(value: unknown): SnapshotEntry | null {
 export function serializeDirectorySnapshot(
   snapshot: DirectorySnapshot,
 ): SerializedDirectorySnapshot {
+  if (snapshot.entries instanceof WorkspaceManifestMap) return {
+    version: 2, exclude: [...snapshot.exclude], entries: snapshot.entries.manifest,
+    ...(snapshot.ignoredPaths ? { ignoredPaths: snapshot.ignoredPaths } : {}),
+  };
   return {
     version: 1,
     exclude: [...snapshot.exclude],
@@ -91,9 +125,11 @@ export function parseDirectorySnapshot(
 }
 
 export function directorySnapshotSha256(snapshot: DirectorySnapshot): string {
-  return createHash("sha256")
-    .update(JSON.stringify(serializeDirectorySnapshot(snapshot)))
-    .digest("hex");
+  if (!(snapshot.entries instanceof WorkspaceManifestMap)) return createHash("sha256")
+    .update(JSON.stringify(serializeDirectorySnapshot(snapshot))).digest("hex");
+  const digest = createHash("sha256").update("workspace-baseline-v2\0").update(JSON.stringify(snapshot.exclude));
+  for (const entry of snapshot.entries) digest.update(JSON.stringify(entry)).update("\0");
+  return digest.digest("hex");
 }
 
 async function hashFile(filePath: string): Promise<string> {
@@ -106,48 +142,24 @@ async function hashFile(filePath: string): Promise<string> {
   });
 }
 
-async function walkDirectory(
-  root: string,
-  exclude: readonly string[],
-  relative = "",
-  out: Map<string, SnapshotEntry> = new Map(),
-): Promise<Map<string, SnapshotEntry>> {
+async function* walkDirectory(
+  root: string, exclude: readonly string[], ignored: ReturnType<typeof workspacePathMatcher>, relative = "",
+): AsyncGenerator<[string, SnapshotEntry]> {
   const current = relative ? path.join(root, relative) : root;
-  const entries = await fs.readdir(current, { withFileTypes: true }).catch(() => []);
-  entries.sort((left, right) => left.name.localeCompare(right.name));
-
-  for (const entry of entries) {
+  for await (const entry of await fs.opendir(current)) {
     const nextRelative = relative ? path.posix.join(relative, entry.name) : entry.name;
-    if (shouldExcludePath(nextRelative, exclude)) continue;
-
+    if (shouldExcludePath(nextRelative, exclude) || ignored.matches(nextRelative)) continue;
     const fullPath = path.join(root, nextRelative);
     const stats = await fs.lstat(fullPath);
-    if (!stats.isDirectory() && !stats.isSymbolicLink() && !stats.isFile()) {
-      continue;
-    }
-
     if (stats.isDirectory()) {
-      out.set(nextRelative, { kind: "dir" });
-      await walkDirectory(root, exclude, nextRelative, out);
-      continue;
+      yield [nextRelative, { kind: "dir" }];
+      yield* walkDirectory(root, exclude, ignored, nextRelative);
+    } else if (stats.isSymbolicLink()) {
+      yield [nextRelative, { kind: "symlink", target: await fs.readlink(fullPath) }];
+    } else if (stats.isFile()) {
+      yield [nextRelative, { kind: "file", mode: stats.mode, hash: await hashFile(fullPath) }];
     }
-
-    if (stats.isSymbolicLink()) {
-      out.set(nextRelative, {
-        kind: "symlink",
-        target: await fs.readlink(fullPath),
-      });
-      continue;
-    }
-
-    out.set(nextRelative, {
-      kind: "file",
-      mode: stats.mode,
-      hash: await hashFile(fullPath),
-    });
   }
-
-  return out;
 }
 
 async function readSnapshotEntry(root: string, relative: string): Promise<SnapshotEntry | null> {
@@ -189,6 +201,69 @@ function entriesMatch(left: SnapshotEntry | null | undefined, right: SnapshotEnt
 }
 
 const LOCK_STALE_MS = 30_000;
+
+/**
+ * Absolute upper bound on how long any directory merge may legitimately hold
+ * the lock. A merge takes seconds, so a lock older than this is a leftover from
+ * a crashed or restarted process. This is only a backstop for owner records
+ * that carry no instance identity (locks written before this field existed);
+ * the instance identity below reclaims a reused PID directly.
+ */
+const LOCK_MAX_AGE_MS = 15 * 60_000;
+
+/**
+ * The host's boot id (`/proc/sys/kernel/random/boot_id`). The start-time tick
+ * counter restarts at boot, so a host reboot combined with a persistent
+ * workspace volume could let a fresh process reuse the same PID *and* the same
+ * start tick as the dead owner. Prefixing the boot id makes that collision
+ * impossible. `null` when `/proc` is unavailable or the file is unreadable.
+ */
+function readBootId(): string | null {
+  try {
+    const raw = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    return raw.length > 0 ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+const BOOT_ID = readBootId();
+
+/**
+ * Reads a process's kernel start time (`/proc/<pid>/stat` field 22, in clock
+ * ticks since boot) and turns it into a stable identity for that process launch.
+ * The start time is fixed for the lifetime of a process and differs for every
+ * new process, so it distinguishes a live owner from an unrelated process that
+ * merely reused its PID after a container restart. The boot id is included so a
+ * reboot that restarts the tick counter cannot alias a previous launch.
+ *
+ * Returns `null` when `/proc` is unavailable (non-Linux) or unreadable, so the
+ * caller keeps the plain PID-liveness behavior there.
+ */
+function processStartInstanceId(pid: number): string | null {
+  try {
+    const raw = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // Field 2 (`comm`) may contain spaces and parentheses, so anchor the field
+    // split on the final ")" rather than the first space.
+    const close = raw.lastIndexOf(")");
+    if (close < 0) return null;
+    // After `comm`, the next token is field 3, so field 22 is index 22 - 3.
+    const startTime = raw.slice(close + 1).trim().split(/\s+/)[19];
+    return startTime ? `linux-starttime:${BOOT_ID ?? "no-boot-id"}:${startTime}` : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The identity of this server process launch, recorded in `owner.json` beside
+ * the PID. Computed once at module load. On Linux it is the process start time
+ * (see {@link processStartInstanceId}); elsewhere it falls back to a random id,
+ * which still distinguishes this process launch on PID-reuse detection but
+ * cannot validate another PID's identity — that path keeps the PID-liveness
+ * check.
+ */
+const PROCESS_INSTANCE_ID = processStartInstanceId(process.pid) ?? `process:${randomUUID()}`;
 
 /**
  * The stable `code` a lock-timeout error carries, so a caller can identify it
@@ -266,20 +341,16 @@ export function describeWorkspaceRestoreFailure(code: WorkspaceRestoreFailureCod
 }
 
 async function isLockStale(lockDir: string): Promise<boolean> {
+  let owner: { pid?: unknown; instanceId?: unknown; createdAt?: unknown };
   try {
     const raw = await fs.readFile(path.join(lockDir, "owner.json"), "utf8");
-    const owner = JSON.parse(raw) as { pid?: unknown };
-    const pid = typeof owner.pid === "number" && Number.isFinite(owner.pid) && owner.pid > 0 ? owner.pid : null;
-    if (pid === null) {
-      // Owner record is unparseable / missing pid — treat as stale.
-      return true;
-    }
-    try {
-      process.kill(pid, 0);
-      return false;
-    } catch {
-      return true;
-    }
+    const parsed: unknown = JSON.parse(raw);
+    // A corrupted record can parse to a non-object (`null`, a number, a
+    // string). Reading `.pid` on it would throw out of `isLockStale`, so every
+    // acquire would fail immediately and the lock would never reclaim. Such a
+    // record is not a live holder: treat it as stale so the lock self-heals.
+    if (!parsed || typeof parsed !== "object") return true;
+    owner = parsed as typeof owner;
   } catch {
     // owner.json is missing or unreadable. A live holder also passes through
     // this exact state, briefly, between its own `fs.mkdir(lockDir)` and its
@@ -291,6 +362,50 @@ async function isLockStale(lockDir: string): Promise<boolean> {
     const stat = await fs.stat(lockDir).catch(() => null);
     return !stat || Date.now() - stat.mtimeMs > LOCK_STALE_MS;
   }
+
+  const pid = typeof owner.pid === "number" && Number.isFinite(owner.pid) && owner.pid > 0 ? owner.pid : null;
+  if (pid === null) {
+    // Owner record is unparseable / missing pid — treat as stale.
+    return true;
+  }
+
+  // PID reuse across a container restart is what this guards: the PID is alive
+  // again but belongs to a different process (in Docker the server is always a
+  // low, fixed PID). When the owner recorded the identity of the process that
+  // wrote the lock, a mismatch proves reuse, so the lock is stale even though
+  // `process.kill(pid, 0)` succeeds. A match for our own PID means the lock is
+  // ours and we are alive; a match for another PID means that PID was not
+  // reused and is a genuine live holder (mutual exclusion preserved).
+  const ownerInstanceId =
+    typeof owner.instanceId === "string" && owner.instanceId.length > 0 ? owner.instanceId : null;
+  if (ownerInstanceId !== null) {
+    if (pid === process.pid) {
+      return ownerInstanceId !== PROCESS_INSTANCE_ID;
+    }
+    const liveInstanceId = processStartInstanceId(pid);
+    if (liveInstanceId !== null) {
+      return liveInstanceId !== ownerInstanceId;
+    }
+  } else {
+    // Legacy owner record with no instance identity. The PID check alone cannot
+    // tell a leftover lock from a live holder whose PID was reused, so fall back
+    // to the absolute age backstop: no merge legitimately holds the lock this
+    // long, so an old record is stale even while its PID still exists.
+    const createdAt = typeof owner.createdAt === "string" ? Date.parse(owner.createdAt) : Number.NaN;
+    if (Number.isFinite(createdAt) && Date.now() - createdAt > LOCK_MAX_AGE_MS) {
+      return true;
+    }
+  }
+
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    // EPERM means the PID exists but belongs to another user (or `/proc` hides
+    // it from us): the process is alive, so the lock is live. Only an ESRCH-like
+    // failure means the owner is gone.
+    return (error as NodeJS.ErrnoException).code !== "EPERM";
+  }
 }
 
 async function acquireDirectoryMergeLock(lockDir: string): Promise<() => Promise<void>> {
@@ -300,7 +415,11 @@ async function acquireDirectoryMergeLock(lockDir: string): Promise<() => Promise
       await fs.mkdir(lockDir);
       await fs.writeFile(
         path.join(lockDir, "owner.json"),
-        `${JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() })}\n`,
+        `${JSON.stringify({
+          pid: process.pid,
+          instanceId: PROCESS_INSTANCE_ID,
+          createdAt: new Date().toISOString(),
+        })}\n`,
         "utf8",
       );
       return async () => {
@@ -310,8 +429,10 @@ async function acquireDirectoryMergeLock(lockDir: string): Promise<() => Promise
       const code = error && typeof error === "object" ? (error as { code?: unknown }).code : null;
       if (code !== "EEXIST") throw error;
       // Stale-lock detection: if the owner PID is dead (SIGKILL / OOM / crash),
-      // the lockDir would otherwise persist forever and stall restores. Mirror
-      // the materializePaperclipSkillCopy lock pattern — remove and retry.
+      // or the PID was reused by a different process after a container restart
+      // (the recorded instance identity no longer matches), the lockDir would
+      // otherwise persist forever and stall restores. Mirror the
+      // materializePaperclipSkillCopy lock pattern — remove and retry.
       if (await isLockStale(lockDir)) {
         await fs.rm(lockDir, { recursive: true, force: true }).catch(() => undefined);
         continue;
@@ -444,13 +565,59 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
 
 export async function captureDirectorySnapshot(
   rootDir: string,
-  options: { exclude?: string[] } = {},
+  options: { exclude?: string[]; ignoredPaths?: WorkspacePaths; diskBacked?: boolean } = {},
 ): Promise<DirectorySnapshot> {
   const exclude = [...new Set(options.exclude ?? [])];
-  return {
-    exclude,
-    entries: await walkDirectory(rootDir, exclude),
-  };
+  const ignored = workspacePathMatcher(options.ignoredPaths);
+  let writer: WorkspaceManifestWriter | null = null;
+  try {
+    writer = options.diskBacked ? await createWorkspaceManifest("paperclip-workspace-baseline-") : null;
+    const memory = new Map<string, SnapshotEntry>();
+    for await (const [relative, entry] of walkDirectory(rootDir, exclude, ignored)) {
+      if (writer) writer.add("baseline", relative, JSON.stringify(entry));
+      else memory.set(relative, entry);
+    }
+    const manifest = writer?.paths("baseline");
+    writer?.close();
+    const snapshot: DirectorySnapshot = {
+      exclude, ignoredPaths: options.ignoredPaths,
+      entries: manifest ? new WorkspaceManifestMap(manifest, parseManifestEntry) : memory,
+    };
+    if (writer) ownedDirectorySnapshots.set(snapshot, path.dirname(writer.filePath));
+    return snapshot;
+  } catch (error) {
+    writer?.close(false);
+    if (writer) await fs.rm(path.dirname(writer.filePath), { recursive: true, force: true });
+    throw error;
+  } finally { ignored.close(); }
+}
+
+/** A disk-backed subset for independent nested-repository merges. */
+export async function selectDirectorySnapshot(snapshot: DirectorySnapshot, options: {
+  prefix?: string; omit?: string[]; exclude: string[]; ignoredPaths?: WorkspacePaths;
+}): Promise<DirectorySnapshot> {
+  const writer = await createWorkspaceManifest("paperclip-workspace-baseline-");
+  try {
+    for (const [relative, entry] of snapshot.entries) {
+      if (options.prefix && !relative.startsWith(options.prefix)) continue;
+      if (options.omit?.some((omit) => relative === omit || relative.startsWith(`${omit}/`))) continue;
+      writer.add("baseline", options.prefix ? relative.slice(options.prefix.length) : relative, JSON.stringify(entry));
+    }
+    const result: DirectorySnapshot = { exclude: options.exclude, ignoredPaths: options.ignoredPaths,
+      entries: new WorkspaceManifestMap(writer.paths("baseline"), parseManifestEntry) };
+    writer.close();
+    ownedDirectorySnapshots.set(result, path.dirname(writer.filePath));
+    return result;
+  } catch (error) {
+    writer.close(false);
+    await fs.rm(path.dirname(writer.filePath), { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function orderedEntries(snapshot: DirectorySnapshot, reverse = false): Iterable<[string, SnapshotEntry]> {
+  if (snapshot.entries instanceof WorkspaceManifestMap) return snapshot.entries.entries(reverse);
+  return [...snapshot.entries].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0) * (reverse ? -1 : 1));
 }
 
 export async function mergeDirectoryWithBaseline(input: {
@@ -460,37 +627,31 @@ export async function mergeDirectoryWithBaseline(input: {
   beforeApply?: () => Promise<void>;
   afterApply?: () => Promise<void>;
 }): Promise<void> {
-  const source = await captureDirectorySnapshot(input.sourceDir, { exclude: input.baseline.exclude });
-  await withDirectoryMergeLock(input.targetDir, async (canonicalTargetDir) => {
-    await input.beforeApply?.();
-    const current = await captureDirectorySnapshot(canonicalTargetDir, { exclude: input.baseline.exclude });
-    const deletedLeafEntries = [...input.baseline.entries.entries()]
-      .filter(([relative, entry]) => entry.kind !== "dir" && !source.entries.has(relative))
-      .sort(([left], [right]) => right.length - left.length);
-
-    for (const [relative, baselineEntry] of deletedLeafEntries) {
-      if (!entriesMatch(current.entries.get(relative), baselineEntry)) continue;
-      await fs.rm(path.join(canonicalTargetDir, relative), { recursive: true, force: true }).catch(() => undefined);
-    }
-
-    const deletedDirs = [...input.baseline.entries.entries()]
-      .filter(([relative, entry]) => entry.kind === "dir" && !source.entries.has(relative))
-      .sort(([left], [right]) => right.length - left.length);
-
-    for (const [relative] of deletedDirs) {
-      await fs.rmdir(path.join(canonicalTargetDir, relative)).catch(() => undefined);
-    }
-
-    const changedSourceEntries = [...source.entries.entries()]
-      .filter(([relative, entry]) => !entriesMatch(input.baseline.entries.get(relative), entry))
-      .sort(([left], [right]) => left.localeCompare(right));
-
-    for (const [relative, entry] of changedSourceEntries) {
-      await copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry);
-    }
-
-    await input.afterApply?.();
-  });
+  const options = { exclude: input.baseline.exclude, ignoredPaths: input.baseline.ignoredPaths, diskBacked: true };
+  const source = await captureDirectorySnapshot(input.sourceDir, options);
+  try {
+    await withDirectoryMergeLock(input.targetDir, async (canonicalTargetDir) => {
+      await input.beforeApply?.();
+      const current = await captureDirectorySnapshot(canonicalTargetDir, options);
+      try {
+        for (const [relative, baselineEntry] of orderedEntries(input.baseline)) {
+          if (baselineEntry.kind === "dir" || source.entries.has(relative)) continue;
+          if (!entriesMatch(current.entries.get(relative), baselineEntry)) continue;
+          await fs.rm(path.join(canonicalTargetDir, relative), { recursive: true, force: true });
+        }
+        // Reverse path order visits descendants before their parent directory.
+        for (const [relative, entry] of orderedEntries(input.baseline, true)) {
+          if (entry.kind === "dir" && !source.entries.has(relative)) await fs.rmdir(path.join(canonicalTargetDir, relative)).catch((error: NodeJS.ErrnoException) => {
+            if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY" && error.code !== "ENOTDIR") throw error;
+          });
+        }
+        for (const [relative, entry] of orderedEntries(source)) {
+          if (!entriesMatch(input.baseline.entries.get(relative), entry)) await copySnapshotEntry(input.sourceDir, canonicalTargetDir, relative, entry);
+        }
+        await input.afterApply?.();
+      } finally { await disposeDirectorySnapshot(current); }
+    });
+  } finally { await disposeDirectorySnapshot(source); }
 }
 
 export async function directoryEntryMatchesBaseline(

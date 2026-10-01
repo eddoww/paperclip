@@ -8,6 +8,37 @@ import { resolveRuntimeLikePath } from "./path-resolver.js";
 const AWS_CREDENTIAL_SOURCE_HINT =
   "Provide AWS runtime credentials through the AWS SDK default credential chain: IAM role/workload identity, AWS_PROFILE/SSO/shared credentials, web identity, container/instance metadata, or short-lived shell credentials";
 
+const VAULTWARDEN_BOOTSTRAP_HINT =
+  "Set the Vaultwarden bootstrap variables in the Paperclip server runtime. Prefer mode-0600 *_FILE mounts for the API key secret and the master password. Never store them in Paperclip company secrets or provider vault config.";
+
+interface VaultwardenEnvKey {
+  key: string;
+  required: boolean;
+}
+
+const VAULTWARDEN_ENV_KEYS: VaultwardenEnvKey[] = [
+  { key: "PAPERCLIP_SECRETS_VAULTWARDEN_URL", required: true },
+  { key: "PAPERCLIP_SECRETS_VAULTWARDEN_CLIENT_ID", required: true },
+  { key: "PAPERCLIP_SECRETS_VAULTWARDEN_CLIENT_SECRET", required: true },
+  { key: "PAPERCLIP_SECRETS_VAULTWARDEN_MASTER_PASSWORD", required: true },
+  { key: "PAPERCLIP_SECRETS_VAULTWARDEN_DEVICE_ID", required: false },
+  { key: "PAPERCLIP_SECRETS_VAULTWARDEN_DEVICE_TYPE", required: false },
+];
+
+type VaultwardenEnvSource = "environment" | "file" | "missing";
+
+function vaultwardenEnvSource(key: string): VaultwardenEnvSource {
+  if (process.env[`${key}_FILE`]?.trim()) return "file";
+  if (process.env[key]?.trim()) return "environment";
+  return "missing";
+}
+
+function vaultwardenEnvPresenceReport(): string {
+  return VAULTWARDEN_ENV_KEYS.map(
+    (entry) => `${entry.key}=${vaultwardenEnvSource(entry.key)}`,
+  ).join("; ");
+}
+
 function decodeMasterKey(raw: string): Buffer | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;
@@ -53,13 +84,17 @@ export function secretsCheck(config: PaperclipConfig, configPath?: string): Chec
   if (provider === "aws_secrets_manager") {
     return withStrictModeNote(awsSecretsManagerCheck(), config);
   }
+  if (provider === "vaultwarden") {
+    return withStrictModeNote(vaultwardenSecretsManagerCheck(), config);
+  }
   if (provider !== "local_encrypted") {
     return {
       name: "Secrets adapter",
       status: "fail",
-      message: `${provider} is configured, but this build only supports local_encrypted and aws_secrets_manager`,
+      message: `${provider} is configured, but this build only supports local_encrypted, aws_secrets_manager and vaultwarden`,
       canRepair: false,
-      repairHint: "Run `paperclipai configure --section secrets` and choose local_encrypted or aws_secrets_manager",
+      repairHint:
+        "Run `paperclipai configure --section secrets` and choose local_encrypted, aws_secrets_manager or vaultwarden",
     };
   }
 
@@ -195,6 +230,33 @@ function awsSecretsManagerCheck(): CheckResult {
     name: "Secrets adapter",
     status: "pass",
     message,
+  };
+}
+
+function vaultwardenSecretsManagerCheck(): CheckResult {
+  const missingRequired = VAULTWARDEN_ENV_KEYS.filter(
+    (entry) => entry.required && vaultwardenEnvSource(entry.key) === "missing",
+  );
+  const presenceReport = vaultwardenEnvPresenceReport();
+
+  if (missingRequired.length > 0) {
+    return {
+      name: "Secrets adapter",
+      status: "fail",
+      message:
+        `Vaultwarden / Bitwarden provider is missing required bootstrap variables: ` +
+        `${missingRequired.map((entry) => entry.key).join(", ")}. Variable sources: ${presenceReport}`,
+      canRepair: false,
+      repairHint: VAULTWARDEN_BOOTSTRAP_HINT,
+    };
+  }
+
+  return {
+    name: "Secrets adapter",
+    status: "pass",
+    message:
+      "Vaultwarden / Bitwarden provider bootstrap variables detected. " +
+      `Variable sources: ${presenceReport}`,
   };
 }
 

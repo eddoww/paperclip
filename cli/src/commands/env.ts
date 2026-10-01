@@ -21,6 +21,8 @@ type EnvVarRow = {
   source: EnvSource;
   required: boolean;
   note: string;
+  /** Secret values are reported by presence and source only, never printed. */
+  sensitive?: boolean;
 };
 
 const DEFAULT_AGENT_JWT_TTL_SECONDS = "172800";
@@ -29,6 +31,62 @@ const DEFAULT_AGENT_JWT_AUDIENCE = "paperclip-api";
 const DEFAULT_HEARTBEAT_SCHEDULER_INTERVAL_MS = "30000";
 const DEFAULT_SECRETS_PROVIDER = "local_encrypted";
 const DEFAULT_STORAGE_PROVIDER = "local_disk";
+
+const VAULTWARDEN_ENV_SPECS: { key: string; sensitive: boolean; required: boolean; note: string }[] = [
+  {
+    key: "PAPERCLIP_SECRETS_VAULTWARDEN_URL",
+    sensitive: false,
+    required: true,
+    note: "Vaultwarden instance base URL (origin-only http(s)); provider vault config cannot override it",
+  },
+  {
+    key: "PAPERCLIP_SECRETS_VAULTWARDEN_CLIENT_ID",
+    sensitive: true,
+    required: true,
+    note: "Vaultwarden personal API key id (user.<uuid>)",
+  },
+  {
+    key: "PAPERCLIP_SECRETS_VAULTWARDEN_CLIENT_SECRET",
+    sensitive: true,
+    required: true,
+    note: "Vaultwarden personal API key secret",
+  },
+  {
+    key: "PAPERCLIP_SECRETS_VAULTWARDEN_MASTER_PASSWORD",
+    sensitive: true,
+    required: true,
+    note: "Vaultwarden master password used to unlock the account keys",
+  },
+  {
+    key: "PAPERCLIP_SECRETS_VAULTWARDEN_DEVICE_ID",
+    sensitive: false,
+    required: false,
+    note: "Optional stable device id (UUID); derived from the client id when unset",
+  },
+  {
+    key: "PAPERCLIP_SECRETS_VAULTWARDEN_DEVICE_TYPE",
+    sensitive: false,
+    required: false,
+    note: "Optional Vaultwarden device type number",
+  },
+];
+
+function vaultwardenEnvRows(providerSelected: boolean): EnvVarRow[] {
+  return VAULTWARDEN_ENV_SPECS.map(({ key, sensitive, required, note }) => {
+    const fileKey = `${key}_FILE`;
+    const filePath = process.env[fileKey]?.trim();
+    const inlineValue = process.env[key]?.trim();
+    const source: EnvSource = filePath ? "file" : inlineValue ? "env" : "missing";
+    return {
+      key,
+      value: sensitive ? "" : (inlineValue ?? filePath ?? ""),
+      source,
+      required: providerSelected && required,
+      sensitive,
+      note: source === "file" ? `${note} (via ${fileKey})` : note,
+    };
+  });
+}
 function defaultSecretsKeyFilePath(): string {
   return resolveDefaultSecretsKeyFilePath(resolvePaperclipInstanceId());
 }
@@ -75,8 +133,14 @@ export async function envCommand(opts: { config?: string }): Promise<void> {
         default: "default",
         missing: "missing",
       }[entry.source];
+      const valueDisplay =
+        entry.source === "missing"
+          ? ""
+          : entry.sensitive
+            ? ` ${pc.dim("=>")} ${pc.yellow("[redacted]")}`
+            : ` ${pc.dim("=>")} ${pc.white(quoteShellValue(entry.value))}`;
       p.log.message(
-        `${pc.cyan(entry.key)} ${status.padEnd(7)} ${pc.dim(`[${sourceNote}] ${entry.note}`)}${entry.source === "missing" ? "" : ` ${pc.dim("=>")} ${pc.white(quoteShellValue(entry.value))}`}`,
+        `${pc.cyan(entry.key)} ${status.padEnd(7)} ${pc.dim(`[${sourceNote}] ${entry.note}`)}${valueDisplay}`,
       );
     }
   };
@@ -84,7 +148,9 @@ export async function envCommand(opts: { config?: string }): Promise<void> {
   formatSection("Required environment variables", requiredRows);
   formatSection("Optional environment variables", optionalRows);
 
-  const exportRows = rows.map((row) => (row.source === "missing" ? { ...row, value: "<set-this-value>" } : row));
+  const exportRows = rows.map((row) =>
+    row.source === "missing" || row.sensitive ? { ...row, value: "<set-this-value>" } : row,
+  );
   const uniqueRows = uniqueByKey(exportRows);
   const exportBlock = uniqueRows.map((row) => `export ${row.key}=${quoteShellValue(row.value)}`).join("\n");
 
@@ -301,6 +367,7 @@ function collectDeploymentEnvRows(config: PaperclipConfig | null, configPath: st
       required: false,
       note: "Path to local encrypted secrets key file",
     },
+    ...vaultwardenEnvRows(secretsProvider === "vaultwarden"),
     {
       key: "PAPERCLIP_STORAGE_PROVIDER",
       value: storageProvider,

@@ -229,7 +229,7 @@ const safeShortText = z.string().trim().min(1).max(160);
 const optionalSafeShortText = safeShortText.optional().nullable();
 
 const deniedProviderConfigKeyPattern =
-  /^(access[-_]?key([-_]?id)?|secret[-_]?access[-_]?key|secret[-_]?key|token|password|passwd|credential|credentials|private[-_]?key|pem|jwt|session[-_]?token|service[-_]?account([-_]?json)?|client[-_]?secret|secret[-_]?id|unseal[-_]?key|recovery[-_]?key|key[-_]?file([-_]?path)?|token[-_]?file([-_]?path)?)$/i;
+  /^(access[-_]?key([-_]?id)?|secret[-_]?access[-_]?key|secret[-_]?key|token|password|passwd|master[-_]?password|credential|credentials|private[-_]?key|pem|jwt|session[-_]?token|service[-_]?account([-_]?json)?|client[-_]?secret|secret[-_]?id|unseal[-_]?key|recovery[-_]?key|key[-_]?file([-_]?path)?|token[-_]?file([-_]?path)?)$/i;
 
 function rejectSensitiveProviderConfigKeys(value: unknown, ctx: z.RefinementCtx) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return;
@@ -308,11 +308,31 @@ export const vaultProviderConfigSchema = z.object({
   secretPathPrefix: optionalSafeShortText,
 }).strict();
 
+function rejectVaultwardenBaseUrlOverride(value: unknown, ctx: z.RefinementCtx) {
+  if (value === undefined || value === null) return;
+  // B2: the instance URL comes from PAPERCLIP_SECRETS_VAULTWARDEN_URL only. A
+  // per-company override could redirect the service-account API key to an
+  // attacker-controlled origin, so it is never accepted.
+  ctx.addIssue({
+    code: z.ZodIssueCode.custom,
+    path: ["config", "baseUrl"],
+    message:
+      "Vaultwarden base URL is fixed by the PAPERCLIP_SECRETS_VAULTWARDEN_URL server environment and cannot be set on a provider vault",
+  });
+}
+
+export const vaultwardenProviderConfigSchema = z.object({
+  organizationId: z.string().trim().guid(),
+  collectionId: z.string().trim().guid().optional().nullable(),
+  itemNamePrefix: optionalSafeShortText,
+}).strict();
+
 export const secretProviderConfigPayloadSchema = z.discriminatedUnion("provider", [
   z.object({ provider: z.literal("local_encrypted"), config: localEncryptedProviderConfigSchema }),
   z.object({ provider: z.literal("aws_secrets_manager"), config: awsSecretsManagerProviderConfigSchema }),
   z.object({ provider: z.literal("gcp_secret_manager"), config: gcpSecretManagerProviderConfigSchema }),
   z.object({ provider: z.literal("vault"), config: vaultProviderConfigSchema }),
+  z.object({ provider: z.literal("vaultwarden"), config: vaultwardenProviderConfigSchema }),
 ]);
 
 export const createSecretProviderConfigSchema = z.object({
@@ -363,6 +383,7 @@ export const updateSecretProviderConfigSchema = z.object({
   if (value.config !== undefined) {
     rejectSensitiveProviderConfigKeys(value.config, ctx);
     rejectUnsafeVaultAddress(value.config.address, ctx);
+    rejectVaultwardenBaseUrlOverride(value.config.baseUrl, ctx);
   }
   if ((value.status === "coming_soon" || value.status === "disabled") && value.isDefault) {
     ctx.addIssue({

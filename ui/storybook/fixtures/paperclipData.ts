@@ -1363,6 +1363,7 @@ export const storybookLiveRuns: LiveRunForIssue[] = [
 export const storybookSecretProviders: SecretProviderDescriptor[] = [
   { id: "local_encrypted", label: "Local encrypted", requiresExternalRef: false },
   { id: "aws_secrets_manager", label: "AWS Secrets Manager", requiresExternalRef: false },
+  { id: "vaultwarden", label: "Vaultwarden / Bitwarden", requiresExternalRef: false },
   { id: "gcp_secret_manager", label: "GCP Secret Manager", requiresExternalRef: false },
   { id: "vault", label: "HashiCorp Vault", requiresExternalRef: false },
 ];
@@ -1414,6 +1415,28 @@ export const storybookSecretProviderConfigs: CompanySecretProviderConfig[] = [
     createdByUserId: "user-board",
     createdAt: recent(1_800),
     updatedAt: recent(18),
+  },
+  {
+    id: "provider-config-vaultwarden-prod",
+    companyId: "company-storybook",
+    provider: "vaultwarden",
+    displayName: "Vaultwarden production",
+    status: "ready",
+    isDefault: false,
+    config: {
+      organizationId: "11111111-1111-4111-8111-111111111111",
+      collectionId: "22222222-2222-4222-8222-222222222222",
+      itemNamePrefix: "paperclip/",
+    },
+    healthStatus: "ready",
+    healthCheckedAt: recent(30),
+    healthMessage: "Vaultwarden service account is connected.",
+    healthDetails: null,
+    disabledAt: null,
+    createdByAgentId: null,
+    createdByUserId: "user-board",
+    createdAt: recent(1_200),
+    updatedAt: recent(30),
   },
   {
     id: "provider-config-aws-blocked",

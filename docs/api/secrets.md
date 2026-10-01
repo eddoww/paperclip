@@ -221,16 +221,20 @@ Per-provider `config` shapes:
 - `local_encrypted`: optional `backupReminderAcknowledged: boolean`.
 - `aws_secrets_manager`: required `region`; optional `namespace`,
   `secretNamePrefix`, `kmsKeyId`, `ownerTag`, `environmentTag`.
+- `vaultwarden`: required UUID `organizationId`; optional UUID `collectionId`
+  and `itemNamePrefix`. `baseUrl` is rejected; the instance URL comes only from
+  `PAPERCLIP_SECRETS_VAULTWARDEN_URL`.
 - `gcp_secret_manager` (coming soon): optional `projectId`, `location`,
   `namespace`, `secretNamePrefix`.
 - `vault` (coming soon): optional origin-only HTTPS `address`, `namespace`,
   `mountPath`, `secretPathPrefix`. `address` values with embedded credentials,
   paths, query strings, or fragments are rejected.
 
-`status` defaults to `ready` for `local_encrypted` and `aws_secrets_manager`,
-and to `coming_soon` for `gcp_secret_manager` and `vault`. Coming-soon and
-disabled vaults cannot be marked `isDefault`. Setting `isDefault: true` clears
-the previous default for the same provider in the same transaction.
+`status` defaults to `ready` for `local_encrypted`, `aws_secrets_manager`, and
+`vaultwarden`, and to `coming_soon` for `gcp_secret_manager` and `vault`.
+Coming-soon and disabled vaults cannot be marked `isDefault`. Setting
+`isDefault: true` clears the previous default for the same provider in the same
+transaction.
 
 ### Get Vault
 
@@ -254,7 +258,8 @@ PATCH /api/secret-provider-configs/{id}
 `config` is replaced wholesale on update — pass the full provider config
 payload, not a partial diff. Status transitions for `gcp_secret_manager` and
 `vault` are constrained to `coming_soon` and `disabled` until their runtime
-modules ship.
+modules ship. `vaultwarden` is not constrained; its vaults support the full
+`ready` / `warning` / `disabled` lifecycle.
 
 ### Disable Vault
 
@@ -304,6 +309,11 @@ vaults, `details.guidance` may include missing non-secret env names and the
 expected AWS SDK credential source; coming-soon vaults always return
 `status: "coming_soon"` with `code: "runtime_locked"` and never call into
 provider modules.
+
+For `vaultwarden`, `details` reports presence booleans for the instance base
+URL, client id, client secret, master password, and device id, plus the missing
+variable names and the resolved device type. It never returns the values
+themselves.
 
 ### Selecting A Vault When Creating Or Rotating Secrets
 

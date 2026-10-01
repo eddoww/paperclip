@@ -139,4 +139,27 @@ describe("buildLocalAdapterTestProbeEnv", () => {
       expect(key.toUpperCase()).not.toContain("PROXY");
     }
   });
+
+  it("never forwards Vaultwarden bootstrap credentials from the caller or trusted env", async () => {
+    const { dir } = await makeTrustedPathWithClaude();
+    const built = await buildLocalAdapterTestProbeEnv({
+      callerEnv: {
+        PAPERCLIP_SECRETS_VAULTWARDEN_URL: "https://vault.example.com",
+        PAPERCLIP_SECRETS_VAULTWARDEN_CLIENT_ID: "user.11111111-1111-4111-8111-111111111111",
+        PAPERCLIP_SECRETS_VAULTWARDEN_CLIENT_SECRET: "sentinel-client-secret",
+        PAPERCLIP_SECRETS_VAULTWARDEN_MASTER_PASSWORD: "sentinel-master-password",
+      },
+      trustedEnv: {
+        PATH: dir,
+        PAPERCLIP_SECRETS_VAULTWARDEN_CLIENT_SECRET: "sentinel-client-secret",
+        PAPERCLIP_SECRETS_VAULTWARDEN_MASTER_PASSWORD: "sentinel-master-password",
+      },
+    });
+    for (const key of Object.keys(built.env)) {
+      expect(key).not.toContain("VAULTWARDEN");
+    }
+    const serialized = JSON.stringify(built.env);
+    expect(serialized).not.toContain("sentinel-client-secret");
+    expect(serialized).not.toContain("sentinel-master-password");
+  });
 });

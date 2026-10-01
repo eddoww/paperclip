@@ -278,4 +278,85 @@ describe("secret validators", () => {
       }),
     ).toThrow();
   });
+
+  it("accepts a Vaultwarden provider vault config without a base URL", () => {
+    expect(
+      secretProviderConfigPayloadSchema.parse({
+        provider: "vaultwarden",
+        config: {
+          organizationId: "11111111-1111-4111-8111-111111111111",
+          collectionId: "22222222-2222-4222-8222-222222222222",
+          itemNamePrefix: "paperclip/",
+        },
+      }),
+    ).toEqual({
+      provider: "vaultwarden",
+      config: {
+        organizationId: "11111111-1111-4111-8111-111111111111",
+        collectionId: "22222222-2222-4222-8222-222222222222",
+        itemNamePrefix: "paperclip/",
+      },
+    });
+
+    expect(() =>
+      createSecretProviderConfigSchema.parse({
+        provider: "vaultwarden",
+        displayName: "Vaultwarden",
+        isDefault: true,
+        config: { organizationId: "11111111-1111-4111-8111-111111111111" },
+      }),
+    ).not.toThrow();
+  });
+
+  it("rejects a Vaultwarden base URL override", () => {
+    expect(() =>
+      createSecretProviderConfigSchema.parse({
+        provider: "vaultwarden",
+        displayName: "Vaultwarden",
+        config: {
+          baseUrl: "https://vault.example.com",
+          organizationId: "11111111-1111-4111-8111-111111111111",
+        },
+      }),
+    ).toThrow(/Unrecognized key|fixed by the PAPERCLIP_SECRETS_VAULTWARDEN_URL/i);
+
+    expect(() =>
+      updateSecretProviderConfigSchema.parse({
+        config: { baseUrl: "https://attacker.example" },
+      }),
+    ).toThrow(/PAPERCLIP_SECRETS_VAULTWARDEN_URL/i);
+  });
+
+  it("rejects sensitive or unknown Vaultwarden provider config keys", () => {
+    expect(() =>
+      createSecretProviderConfigSchema.parse({
+        provider: "vaultwarden",
+        displayName: "Vaultwarden",
+        config: {
+          organizationId: "11111111-1111-4111-8111-111111111111",
+          clientSecret: "super-secret",
+        },
+      }),
+    ).toThrow(/sensitive field/i);
+
+    expect(() =>
+      createSecretProviderConfigSchema.parse({
+        provider: "vaultwarden",
+        displayName: "Vaultwarden",
+        config: {
+          organizationId: "11111111-1111-4111-8111-111111111111",
+          masterPassword: "super-secret",
+        },
+      }),
+    ).toThrow(/Unrecognized key|sensitive field/i);
+
+    expect(() =>
+      createSecretProviderConfigSchema.parse({
+        provider: "vaultwarden",
+        displayName: "Vaultwarden",
+        config: { organizationId: "not-a-uuid" },
+      }),
+    ).toThrow();
+  });
 });
+

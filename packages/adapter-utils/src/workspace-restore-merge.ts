@@ -3,7 +3,7 @@ import { createReadStream, readFileSync } from "node:fs";
 import { constants as fsConstants, promises as fs } from "node:fs";
 import path from "node:path";
 import { createWorkspaceManifest, WorkspaceManifestMap, workspacePathMatcher, type PathManifest, type WorkspacePaths, type WorkspaceManifestWriter } from "./workspace-manifest.js";
-import { shouldExcludePath } from "./exclude-patterns.js";
+import { shouldExcludePath, TRANSIENT_WORKSPACE_EXCLUDES } from "./exclude-patterns.js";
 import { resolvePaperclipInstanceRootForAdapter } from "./server-utils.js";
 
 export type SnapshotEntry =
@@ -577,7 +577,7 @@ export async function captureDirectorySnapshot(
   rootDir: string,
   options: { exclude?: string[]; ignoredPaths?: WorkspacePaths; diskBacked?: boolean } = {},
 ): Promise<DirectorySnapshot> {
-  const exclude = [...new Set(options.exclude ?? [])];
+  const exclude = [...new Set([...TRANSIENT_WORKSPACE_EXCLUDES, ...(options.exclude ?? [])])];
   const ignored = workspacePathMatcher(options.ignoredPaths);
   let writer: WorkspaceManifestWriter | null = null;
   try {
@@ -606,14 +606,18 @@ export async function captureDirectorySnapshot(
 export async function selectDirectorySnapshot(snapshot: DirectorySnapshot, options: {
   prefix?: string; omit?: string[]; exclude: string[]; ignoredPaths?: WorkspacePaths;
 }): Promise<DirectorySnapshot> {
+  const exclude = [...new Set([...TRANSIENT_WORKSPACE_EXCLUDES, ...options.exclude])];
   const writer = await createWorkspaceManifest("paperclip-workspace-baseline-");
   try {
     for (const [relative, entry] of snapshot.entries) {
+      if (shouldExcludePath(relative, TRANSIENT_WORKSPACE_EXCLUDES)) continue;
       if (options.prefix && !relative.startsWith(options.prefix)) continue;
       if (options.omit?.some((omit) => relative === omit || relative.startsWith(`${omit}/`))) continue;
-      writer.add("baseline", options.prefix ? relative.slice(options.prefix.length) : relative, JSON.stringify(entry));
+      const selectedRelative = options.prefix ? relative.slice(options.prefix.length) : relative;
+      if (shouldExcludePath(selectedRelative, TRANSIENT_WORKSPACE_EXCLUDES)) continue;
+      writer.add("baseline", selectedRelative, JSON.stringify(entry));
     }
-    const result: DirectorySnapshot = { exclude: options.exclude, ignoredPaths: options.ignoredPaths,
+    const result: DirectorySnapshot = { exclude, ignoredPaths: options.ignoredPaths,
       entries: new WorkspaceManifestMap(writer.paths("baseline"), parseManifestEntry) };
     writer.close();
     ownedDirectorySnapshots.set(result, path.dirname(writer.filePath));
@@ -625,9 +629,13 @@ export async function selectDirectorySnapshot(snapshot: DirectorySnapshot, optio
   }
 }
 
-function orderedEntries(snapshot: DirectorySnapshot, reverse = false): Iterable<[string, SnapshotEntry]> {
-  if (snapshot.entries instanceof WorkspaceManifestMap) return snapshot.entries.entries(reverse);
-  return [...snapshot.entries].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0) * (reverse ? -1 : 1));
+function* orderedEntries(snapshot: DirectorySnapshot, reverse = false): Iterable<[string, SnapshotEntry]> {
+  const entries = snapshot.entries instanceof WorkspaceManifestMap
+    ? snapshot.entries.entries(reverse)
+    : [...snapshot.entries].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0) * (reverse ? -1 : 1));
+  for (const entry of entries) {
+    if (!shouldExcludePath(entry[0], TRANSIENT_WORKSPACE_EXCLUDES)) yield entry;
+  }
 }
 
 export class DirectoryMergeConflict extends Error {
@@ -648,6 +656,7 @@ export function directoryMergeConflicts(baseline: DirectorySnapshot, source: Dir
     for (const [name] of source.entries) if (!baseline.entries.has(name)) yield name;
   }
   for (const relative of changedPaths()) {
+    if (shouldExcludePath(relative, TRANSIENT_WORKSPACE_EXCLUDES)) continue;
     const before = baseline.entries.get(relative);
     const incoming = source.entries.get(relative);
     const present = current.entries.get(relative);
@@ -662,6 +671,7 @@ export function directoryMergeConflicts(baseline: DirectorySnapshot, source: Dir
   // Stream each current entry once. A replacement must not remove children
   // omitted from the baseline, including excluded or newly created files.
   for (const [child, entry] of current.entries) {
+    if (shouldExcludePath(child, TRANSIENT_WORKSPACE_EXCLUDES)) continue;
     if (same(entry, baseline.entries.get(child)) || same(entry, source.entries.get(child))) continue;
     for (let parent = path.posix.dirname(child); parent !== "."; parent = path.posix.dirname(parent)) {
       if (baseline.entries.get(parent)?.kind === "dir" && source.entries.get(parent)?.kind !== "dir") {

@@ -1,3 +1,9 @@
+export const TRANSIENT_WORKSPACE_EXCLUDES = [
+  ".git/lfs/tmp",
+  "*/.git/lfs/tmp",
+  ".paperclip-merge-*",
+] as const;
+
 export function isRelativePathOrDescendant(relative: string, candidate: string): boolean {
   return relative === candidate || relative.startsWith(`${candidate}/`);
 }
@@ -10,6 +16,10 @@ function pathContainsSegmentOrDescendant(relative: string, segment: string): boo
 }
 
 export function excludePatternMatches(relative: string, pattern: string): boolean {
+  if (/^[^/*?\[\]\\]+\*$/.test(pattern)) {
+    const prefix = pattern.slice(0, -1);
+    return relative.split("/").some((segment) => segment.startsWith(prefix));
+  }
   if (pattern.startsWith("*/") && pattern.endsWith("/*")) {
     return pathContainsSegmentOrDescendant(relative, pattern.slice(2, -2));
   }

@@ -17,6 +17,7 @@ import {
   mergeDirectoryWithBaseline,
   parseDirectorySnapshot,
   serializeDirectorySnapshot,
+  selectDirectorySnapshot,
   withDirectoryMergeLock,
   WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE,
 } from "./workspace-restore-merge.js";
@@ -30,6 +31,95 @@ describe("workspace restore merge", () => {
       if (!dir) continue;
       await rm(dir, { recursive: true, force: true }).catch(() => undefined);
     }
+  });
+
+  it.each([false, true])("never reads transient paths during snapshot and strict preflight (diskBacked=%s)", async (diskBacked) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-transient-"));
+    cleanupDirs.push(root);
+    const targetDir = path.join(root, "target");
+    const sourceDir = path.join(root, "source");
+    const prefixes = ["", "repos/deep/project/"];
+    const transient = prefixes.flatMap((prefix) => [
+      `${prefix}.git/lfs/tmp`, `${prefix}.paperclip-merge-file`, `${prefix}.paperclip-merge-dir`,
+    ]);
+    const preserved = prefixes.flatMap((prefix) => [
+      `${prefix}.git/HEAD`, `${prefix}.git/objects/ab/history`, `${prefix}.git/lfs/objects/ab/object`,
+      `${prefix}.git/lfs/tmp-other`, `${prefix}images/photo.png`, `${prefix}.paperclip-merge`,
+    ]);
+    for (const dir of [targetDir, sourceDir]) {
+      for (const relative of preserved) {
+        await mkdir(path.dirname(path.join(dir, relative)), { recursive: true });
+        await writeFile(path.join(dir, relative), "keep");
+      }
+      for (const relative of transient) {
+        if (relative.endsWith("file")) await writeFile(path.join(dir, relative), "volatile");
+        else {
+          await mkdir(path.join(dir, relative), { recursive: true });
+          await writeFile(path.join(dir, relative, "volatile"), "volatile");
+        }
+      }
+    }
+    const actualLstat = fsPromises.lstat.bind(fsPromises);
+    const reads: string[] = [];
+    const spy = vi.spyOn(fsPromises, "lstat").mockImplementation((async (...args: Parameters<typeof fsPromises.lstat>) => {
+      const name = String(args[0]);
+      if ([targetDir, sourceDir].some((dir) => transient.some((relative) => name === path.join(dir, relative) || name.startsWith(`${path.join(dir, relative)}/`)))) {
+        reads.push(name);
+        throw new Error("Transient path read");
+      }
+      return actualLstat(...args);
+    }) as typeof fsPromises.lstat);
+    let baseline;
+    let running = true;
+    const churn = (async () => {
+      while (running) {
+        for (const prefix of prefixes) {
+          const file = path.join(targetDir, `${prefix}.git/lfs/tmp/churn`);
+          await writeFile(file, "changing");
+          await rm(file, { force: true });
+          const mergeFile = path.join(targetDir, `${prefix}.paperclip-merge-churn`);
+          await writeFile(mergeFile, "changing");
+          await rm(mergeFile, { force: true });
+        }
+      }
+    })();
+    try {
+      baseline = await captureDirectorySnapshot(targetDir, { exclude: [], diskBacked });
+      for (const relative of transient) expect(baseline.entries.has(relative)).toBe(false);
+      for (const relative of preserved) expect(baseline.entries.has(relative)).toBe(true);
+      await writeFile(path.join(sourceDir, "images/photo.png"), "updated");
+      await mergeDirectoryWithBaseline({ baseline, sourceDir, targetDir, conflictPolicy: "reject" });
+      expect(await readFile(path.join(targetDir, "images/photo.png"), "utf8")).toBe("updated");
+      expect(reads).toEqual([]);
+    } finally {
+      running = false;
+      await churn;
+      spy.mockRestore();
+      await disposeDirectorySnapshot(baseline ?? null);
+    }
+  });
+
+  it.each([undefined, "reject"] as const)("filters persisted legacy transient entries during selection and merge (%s)", async (conflictPolicy) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-legacy-transient-"));
+    cleanupDirs.push(root);
+    const targetDir = path.join(root, "target");
+    const sourceDir = path.join(root, "source");
+    await mkdir(targetDir);
+    await mkdir(sourceDir);
+    const baseline = parseDirectorySnapshot({ version: 1, exclude: [], entries: [
+      [".paperclip-merge-legacy", { kind: "dir" }],
+      ["repos/deep/.git/lfs/tmp", { kind: "dir" }],
+      ["repos/deep/.git/lfs/objects", { kind: "dir" }],
+    ] })!;
+    const selected = await selectDirectorySnapshot(baseline, { prefix: "repos/deep/", exclude: [] });
+    try {
+      expect([...selected.entries].map(([relative]) => relative)).toEqual([".git/lfs/objects"]);
+      await mkdir(path.join(targetDir, ".paperclip-merge-legacy"));
+      await mkdir(path.join(sourceDir, ".paperclip-merge-incoming"));
+      await mergeDirectoryWithBaseline({ baseline, sourceDir, targetDir, conflictPolicy });
+      expect((await lstat(path.join(targetDir, ".paperclip-merge-legacy"))).isDirectory()).toBe(true);
+      await expect(lstat(path.join(targetDir, ".paperclip-merge-incoming"))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { await disposeDirectorySnapshot(selected); }
   });
 
   it("round-trips a deterministic durable snapshot and rejects traversal", async () => {

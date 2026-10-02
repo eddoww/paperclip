@@ -5,6 +5,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Transform } from "node:stream";
+import { shouldExcludePath, TRANSIENT_WORKSPACE_EXCLUDES } from "./exclude-patterns.js";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
 import {
   createUnrelatedHistoryGraftCommit,
@@ -409,7 +410,7 @@ async function createSshAuthArgs(
 }
 
 function tarExcludeArgs(exclude: string[] | undefined): string[] {
-  const combined = ["._*", ...(exclude ?? [])];
+  const combined = ["._*", ...TRANSIENT_WORKSPACE_EXCLUDES, ...(exclude ?? [])];
   return combined.flatMap((entry) => ["--exclude", entry]);
 }
 
@@ -442,6 +443,7 @@ async function estimateLocalDirSize(input: {
 }): Promise<number> {
   const regexes = ["._*", ...(input.exclude ?? [])].map(tarPatternToRegExp);
   const isExcluded = (relPath: string, base: string) =>
+    shouldExcludePath(relPath, TRANSIENT_WORKSPACE_EXCLUDES) ||
     regexes.some((regex) => regex.test(relPath) || regex.test(base));
 
   let total = 0;

@@ -414,6 +414,22 @@ function tarExcludeArgs(exclude: string[] | undefined): string[] {
   return combined.flatMap((entry) => ["--exclude", entry]);
 }
 
+function directoryArchiveScript(input: { exclude?: string[]; followSymlinks?: boolean }): string {
+  const patterns = ["._*", ...TRANSIENT_WORKSPACE_EXCLUDES, ...(input.exclude ?? [])];
+  const predicates = patterns.flatMap((pattern, index) => [
+    ...(index > 0 ? ["-o"] : []),
+    ...(pattern.includes("/")
+      ? ["-path", shellQuote(`./${pattern}`), "-o", "-path", shellQuote(`*/${pattern}`)]
+      : ["-name", shellQuote(pattern)]),
+  ]).join(" ");
+  return [
+    'members=$(mktemp "${TMPDIR:-/tmp}/paperclip-ssh-members.XXXXXX") || exit',
+    'trap \'rm -f "$members"\' EXIT HUP INT TERM',
+    `find ${input.followSymlinks ? "-L " : ""}. \\( ${predicates} \\) -prune -o -print0 > "$members" || exit`,
+    `tar ${[...(input.followSymlinks ? ["-h"] : []), ...tarExcludeArgs(input.exclude).map(shellQuote), "--no-recursion", "--null", "-cf", "-", "-T", '"$members"'].join(" ")}; status=$?; exit "$status"`,
+  ].join("; ");
+}
+
 function tarSpawnEnv(): NodeJS.ProcessEnv {
   return {
     ...process.env,
@@ -606,6 +622,7 @@ async function copyDirectoryContents(sourceDir: string, targetDir: string): Prom
       recursive: true,
       force: true,
       preserveTimestamps: true,
+      verbatimSymlinks: true,
     });
   }));
 }
@@ -1354,16 +1371,8 @@ export async function syncDirectoryToSsh(input: {
 
   try {
     await new Promise<void>((resolve, reject) => {
-    const tarArgs = [
-      ...(input.followSymlinks ? ["-h"] : []),
-      "-C",
-      input.localDir,
-      ...tarExcludeArgs(input.exclude),
-      "-cf",
-      "-",
-      ".",
-    ];
-    const tar = spawn("tar", tarArgs, {
+    const tar = spawn("sh", ["-c", directoryArchiveScript(input)], {
+      cwd: input.localDir,
       stdio: ["ignore", "pipe", "pipe"],
       env: tarSpawnEnv(),
     });
@@ -1451,7 +1460,7 @@ export async function syncDirectoryFromSsh(input: {
   const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
   const remoteTarScript = [
     `cd ${shellQuote(input.remoteDir)}`,
-    `tar ${[...tarExcludeArgs(input.exclude).map(shellQuote), "-cf", "-", "."].join(" ")}`,
+    `( ${directoryArchiveScript(input)} )`,
   ].join(" && ");
   const sshArgs = [
     ...auth.args,

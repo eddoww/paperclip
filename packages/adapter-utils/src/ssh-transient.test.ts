@@ -3,12 +3,135 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { expect, it, vi } from "vitest";
-import { syncDirectoryFromSsh, syncDirectoryToSsh } from "./ssh.js";
+import { shellQuote, syncDirectoryFromSsh, syncDirectoryToSsh } from "./ssh.js";
 import { excludePatternMatches } from "./exclude-patterns.js";
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   return { ...actual, spawn: vi.fn(actual.spawn) };
+});
+
+it.each((["to", "from"] as const).flatMap((direction) =>
+  ["", "a/b/c"].map((relative) => ({ direction, relative })),
+))("$direction SSH archives tolerate excluded churn in '$relative'", async ({ direction, relative }) => {
+  await withConcurrentTar(direction, relative, "excluded");
+}, 30_000);
+
+it.each((["to", "from"] as const).flatMap((direction) =>
+  (["included", "read", "transport"] as const).map((failure) => ({ direction, failure })),
+))("$direction SSH archives reject $failure failures", async ({ direction, failure }) => {
+  await withConcurrentTar(direction, "a/b/c", failure);
+}, 30_000);
+
+async function withConcurrentTar(direction: "to" | "from", relative: string, mode: "excluded" | "included" | "read" | "transport") {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-tar-concurrent-"));
+  const source = path.join(root, "source");
+  const destination = path.join(root, "destination");
+  const dir = path.join(source, relative);
+  const payload = path.join(dir, "payload");
+  const marker = path.join(root, "checkpoint");
+  const action = path.join(root, "action.sh");
+  const previous = process.env.TAR_OPTIONS;
+  const { spawn: actualSpawn } = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+  const spawnSpy = vi.mocked(spawn).mockImplementation(((command: string, args: readonly string[], options: import("node:child_process").SpawnOptions) => {
+    if (command === "ssh") {
+      const script = String(args.at(-1));
+      return actualSpawn("sh", ["-c", mode === "transport" ? `${script}; printf 'transport failed' >&2; exit 23` : script], options);
+    }
+    return actualSpawn(command, args, options);
+  }) as typeof spawn);
+  try {
+    await fs.mkdir(dir, { recursive: true });
+    await fs.mkdir(path.join(dir, "empty"));
+    await fs.mkdir(destination);
+    await fs.writeFile(path.join(destination, "preserve"), "local");
+    await fs.writeFile(payload, Buffer.alloc(256 * 1024, 65));
+    await fs.writeFile(path.join(dir, "unreadable"), "must be read", { mode: mode === "read" ? 0o000 : 0o600 });
+    await fs.symlink("payload", path.join(dir, "link"));
+    await fs.writeFile(path.join(dir, "skip"), "excluded by caller");
+    const mutation = mode === "included"
+      ? `printf changed >> ${shellQuote(payload)}`
+      : mode === "read" || mode === "transport"
+        ? "true"
+        : `touch ${shellQuote(path.join(dir, ".paperclip-merge-churn"))}; rm -f ${shellQuote(path.join(dir, ".paperclip-merge-churn"))}`;
+    await fs.writeFile(action, `#!/bin/sh\nif [ "$TAR_SUBCOMMAND" = "-c" ]${mode === "included" ? "" : ` && [ ! -e ${shellQuote(marker)} ]`}; then touch ${shellQuote(marker)}; ${mutation}; fi\n`, { mode: 0o700 });
+    process.env.TAR_OPTIONS = `--checkpoint=${mode === "included" ? 4 : 1} --checkpoint-action=exec=${action}`;
+    const spec = { host: "localhost", port: 22, username: "fixture", remoteCwd: root, remoteWorkspacePath: root, privateKey: null, knownHosts: null, strictHostKeyChecking: false } as const;
+    const transfer = direction === "to"
+      ? syncDirectoryToSsh({ spec, localDir: source, remoteDir: destination, exclude: ["skip"] })
+      : syncDirectoryFromSsh({ spec, remoteDir: source, localDir: destination, exclude: ["skip"], preserveLocalEntries: ["preserve"] });
+    if (mode !== "excluded") {
+      await expect(transfer, `${direction}: ${mode}`).rejects.toThrow(mode === "included" ? /file changed as we read it/ : mode === "read" ? /Cannot open|Permission denied/ : /transport failed/);
+      if (direction === "from") expect(await fs.readFile(path.join(destination, "preserve"), "utf8")).toBe("local");
+    } else {
+      await transfer;
+      expect(await fs.readFile(path.join(destination, relative, "payload"))).toEqual(Buffer.alloc(256 * 1024, 65));
+      expect(await fs.readlink(path.join(destination, relative, "link"))).toBe("payload");
+      expect((await fs.stat(path.join(destination, relative, "empty"))).isDirectory()).toBe(true);
+      expect(await fs.readFile(path.join(destination, "preserve"), "utf8")).toBe("local");
+      await expect(fs.stat(path.join(destination, relative, "skip"))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(fs.stat(path.join(destination, relative, ".paperclip-merge-churn"))).rejects.toMatchObject({ code: "ENOENT" });
+    }
+    await fs.stat(marker);
+  } finally {
+    if (previous === undefined) delete process.env.TAR_OPTIONS;
+    else process.env.TAR_OPTIONS = previous;
+    spawnSpy.mockRestore();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
+it("follows file and directory symlinks only when requested and handles NUL-listed names", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-tar-links-"));
+  const source = path.join(root, "source");
+  const external = path.join(root, "external");
+  const destination = path.join(root, "destination");
+  const { spawn: actualSpawn } = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+  const spawnSpy = vi.mocked(spawn).mockImplementation(((command: string, args: readonly string[], options: import("node:child_process").SpawnOptions) =>
+    command === "ssh" ? actualSpawn("sh", ["-c", String(args.at(-1))], options) : actualSpawn(command, args, options)
+  ) as typeof spawn);
+  try {
+    await fs.mkdir(source);
+    await fs.mkdir(external);
+    await fs.writeFile(path.join(external, "file"), "external");
+    await fs.symlink(external, path.join(source, "directory-link"));
+    await fs.symlink(path.join(external, "file"), path.join(source, "file-link"));
+    const names = ["-option", "line\nbreak", "space ' quote", "glob[*]?"];
+    for (const name of names) await fs.writeFile(path.join(source, name), name);
+    const spec = { host: "localhost", port: 22, username: "fixture", remoteCwd: root, remoteWorkspacePath: root, privateKey: null, knownHosts: null, strictHostKeyChecking: false } as const;
+    await syncDirectoryToSsh({ spec, localDir: source, remoteDir: destination, followSymlinks: true });
+    for (const name of names) expect(await fs.readFile(path.join(destination, name), "utf8")).toBe(name);
+    expect(await fs.readFile(path.join(destination, "directory-link", "file"), "utf8")).toBe("external");
+    expect(await fs.readFile(path.join(destination, "file-link"), "utf8")).toBe("external");
+    expect((await fs.lstat(path.join(destination, "file-link"))).isFile()).toBe(true);
+    expect((await fs.lstat(path.join(destination, "directory-link"))).isDirectory()).toBe(true);
+  } finally {
+    spawnSpy.mockRestore();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+it.each(["to", "from"] as const)("%s SSH archives reject a missing source directory", async (direction) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-tar-missing-"));
+  const { spawn: actualSpawn } = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+  const spawnSpy = vi.mocked(spawn).mockImplementation(((command: string, args: readonly string[], options: import("node:child_process").SpawnOptions) =>
+    command === "ssh" ? actualSpawn("sh", ["-c", String(args.at(-1))], options) : actualSpawn(command, args, options)
+  ) as typeof spawn);
+  try {
+    const spec = { host: "localhost", port: 22, username: "fixture", remoteCwd: root, remoteWorkspacePath: root, privateKey: null, knownHosts: null, strictHostKeyChecking: false } as const;
+    const source = path.join(root, "missing");
+    const destination = path.join(root, "destination");
+    await fs.mkdir(destination);
+    await fs.writeFile(path.join(destination, "preserve"), "local");
+    await expect(direction === "to"
+      ? syncDirectoryToSsh({ spec, localDir: source, remoteDir: destination })
+      : syncDirectoryFromSsh({ spec, remoteDir: source, localDir: destination })
+    ).rejects.toThrow();
+    expect(await fs.readFile(path.join(destination, "preserve"), "utf8")).toBe("local");
+  } finally {
+    spawnSpy.mockRestore();
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 it("matches only literal basename-prefix globs at any depth", () => {

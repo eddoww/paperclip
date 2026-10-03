@@ -8,9 +8,12 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { resolvePaperclipInstanceRootForAdapter } from "./server-utils.js";
+import { workspacePaths } from "./workspace-manifest.js";
 import {
   captureDirectorySnapshot,
   directorySnapshotSha256,
+  directoryMergeConflicts,
+  DirectoryMergeConflict,
   disposeDirectorySnapshot,
   classifyWorkspaceRestoreFailure,
   describeWorkspaceRestoreFailure,
@@ -84,8 +87,13 @@ describe("workspace restore merge", () => {
       }
     })();
     try {
-      baseline = await captureDirectorySnapshot(targetDir, { exclude: [], diskBacked });
-      for (const relative of transient) expect(baseline.entries.has(relative)).toBe(false);
+      baseline = await captureDirectorySnapshot(targetDir, { exclude: [], diskBacked, captureTransientOccupancy: true });
+      const occupancy = [...workspacePaths(baseline.transientPaths!)];
+      for (const relative of transient) {
+        expect(baseline.entries.has(relative)).toBe(false);
+        expect(occupancy).toContain(relative);
+        expect(occupancy.some((name) => name.startsWith(`${relative}/`))).toBe(false);
+      }
       for (const relative of preserved) expect(baseline.entries.has(relative)).toBe(true);
       await writeFile(path.join(sourceDir, "images/photo.png"), "updated");
       await mergeDirectoryWithBaseline({ baseline, sourceDir, targetDir, conflictPolicy: "reject" });
@@ -120,6 +128,63 @@ describe("workspace restore merge", () => {
       expect((await lstat(path.join(targetDir, ".paperclip-merge-legacy"))).isDirectory()).toBe(true);
       await expect(lstat(path.join(targetDir, ".paperclip-merge-incoming"))).rejects.toMatchObject({ code: "ENOENT" });
     } finally { await disposeDirectorySnapshot(selected); }
+  });
+
+  it.each(["file", "symlink"] as const)("protects explicitly supplied legacy transient children from %s replacement", (kind) => {
+    const transient = "parent/.paperclip-merge-live";
+    const child = { kind: "file" as const, mode: 0o100600, hash: "a".repeat(64) };
+    const baseline = parseDirectorySnapshot({ version: 1, exclude: [], entries: [
+      ["parent", { kind: "dir" }], [transient, child],
+    ] })!;
+    const source = parseDirectorySnapshot({ version: 1, exclude: [], entries: [
+      ["parent", kind === "file" ? child : { kind: "symlink", target: "elsewhere" }], [transient, child],
+    ] })!;
+    expect(directoryMergeConflicts(baseline, source, baseline)).toEqual([transient]);
+    const nested = parseDirectorySnapshot({ version: 1, exclude: [], entries: [
+      ["parent", { kind: "dir" }], [transient, { kind: "dir" }], [`${transient}/child`, child],
+    ] })!;
+    expect(directoryMergeConflicts(nested, {
+      exclude: [], entries: new Map([["parent", { kind: "dir" }]]),
+    }, nested)).toEqual([]);
+    expect(directoryMergeConflicts(baseline, baseline, {
+      exclude: [], entries: new Map([["parent", { kind: "dir" }], [transient, { ...child, hash: "b".repeat(64) }]]),
+    })).toEqual([]);
+  });
+
+  it.each([false, true].flatMap((legacy) => ["file", "symlink"].flatMap((kind) =>
+    ["parent/.paperclip-merge-live", "parent/.git/lfs/tmp"].map((transient) => ({ legacy, kind, transient })),
+  )))("rejects $kind replacement with transient occupancy ($transient, legacy=$legacy)", async ({ legacy, kind, transient }) => {
+    const root = await mkdtemp(path.join(process.env.PAPERCLIP_RUN_SCRATCH_DIR ?? os.tmpdir(), "paperclip-transient-replacement-"));
+    cleanupDirs.push(root);
+    const targetDir = path.join(root, "target");
+    const sourceDir = path.join(root, "source");
+    await mkdir(path.join(targetDir, transient), { recursive: true });
+    await writeFile(path.join(targetDir, transient, "unreadable"), "preserve");
+    await chmod(path.join(targetDir, transient, "unreadable"), 0);
+    await mkdir(sourceDir);
+    const captured = await captureDirectorySnapshot(targetDir, { exclude: [], diskBacked: !legacy });
+    const baseline = legacy ? parseDirectorySnapshot({ version: 1, exclude: [], entries: [
+      ...captured.entries, [transient, { kind: "dir" }],
+      [`${transient}/unreadable`, { kind: "file", mode: 0o100000, hash: "a".repeat(64) }],
+    ] })! : captured;
+    if (kind === "file") await writeFile(path.join(sourceDir, "parent"), "replacement");
+    else await symlink("elsewhere", path.join(sourceDir, "parent"));
+    await writeFile(path.join(sourceDir, "unrelated"), "must not apply");
+    const actualOpendir = fsPromises.opendir.bind(fsPromises);
+    const spy = vi.spyOn(fsPromises, "opendir").mockImplementation((async (...args: Parameters<typeof fsPromises.opendir>) => {
+      if (String(args[0]).startsWith(path.join(targetDir, transient))) throw new Error("Transient contents walked");
+      return actualOpendir(...args);
+    }) as typeof fsPromises.opendir);
+    try {
+      await expect(mergeDirectoryWithBaseline({ baseline, sourceDir, targetDir, conflictPolicy: "reject" })).rejects.toBeInstanceOf(DirectoryMergeConflict);
+      expect((await lstat(path.join(targetDir, "parent"))).isDirectory()).toBe(true);
+      await chmod(path.join(targetDir, transient, "unreadable"), 0o600);
+      expect(await readFile(path.join(targetDir, transient, "unreadable"), "utf8")).toBe("preserve");
+      await expect(lstat(path.join(targetDir, "unrelated"))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      spy.mockRestore();
+      await disposeDirectorySnapshot(captured);
+    }
   });
 
   it("round-trips a deterministic durable snapshot and rejects traversal", async () => {

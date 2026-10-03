@@ -25,6 +25,7 @@ vi.mock("./ssh.js", () => ({
   syncDirectoryToSsh,
 }));
 
+import { TRANSIENT_WORKSPACE_EXCLUDES } from "./exclude-patterns.js";
 import { prepareRemoteManagedRuntime } from "./remote-managed-runtime.js";
 import { resolveReferencedSourceIgnore } from "./sandbox-managed-runtime.js";
 import { setExpensiveWorkspaceGitExecutor } from "./git-workspace-sync.js";
@@ -50,7 +51,7 @@ describe("remote managed runtime", () => {
     await prepared.restoreWorkspace();
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledWith(expect.objectContaining({
       restoreGitHistory: false, baselineSnapshot: expect.objectContaining({
-        exclude: [".paperclip-runtime", "explicitly-excluded"],
+        exclude: [...TRANSIENT_WORKSPACE_EXCLUDES, ".paperclip-runtime", "explicitly-excluded"],
         entries: expect.any(Map),
       }),
     }));

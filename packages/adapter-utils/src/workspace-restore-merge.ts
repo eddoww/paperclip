@@ -2,8 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, readFileSync } from "node:fs";
 import { constants as fsConstants, promises as fs } from "node:fs";
 import path from "node:path";
-import { createWorkspaceManifest, WorkspaceManifestMap, workspacePathMatcher, type PathManifest, type WorkspacePaths, type WorkspaceManifestWriter } from "./workspace-manifest.js";
-import { shouldExcludePath } from "./exclude-patterns.js";
+import { createWorkspaceManifest, WorkspaceManifestMap, workspacePathMatcher, workspacePaths, type PathManifest, type WorkspacePaths, type WorkspaceManifestWriter } from "./workspace-manifest.js";
+import { shouldExcludePath, TRANSIENT_WORKSPACE_EXCLUDES } from "./exclude-patterns.js";
 import { resolvePaperclipInstanceRootForAdapter } from "./server-utils.js";
 
 export type SnapshotEntry =
@@ -15,6 +15,7 @@ export interface DirectorySnapshot {
   exclude: string[];
   entries: Map<string, SnapshotEntry> | WorkspaceManifestMap<SnapshotEntry>;
   ignoredPaths?: WorkspacePaths;
+  transientPaths?: WorkspacePaths;
 }
 
 export interface LegacySerializedDirectorySnapshot {
@@ -143,17 +144,21 @@ async function hashFile(filePath: string): Promise<string> {
 }
 
 async function* walkDirectory(
-  root: string, exclude: readonly string[], ignored: ReturnType<typeof workspacePathMatcher>, relative = "",
+  root: string, exclude: readonly string[], ignored: ReturnType<typeof workspacePathMatcher>, transient?: (relative: string) => void, relative = "",
 ): AsyncGenerator<[string, SnapshotEntry]> {
   const current = relative ? path.join(root, relative) : root;
   for await (const entry of await fs.opendir(current)) {
     const nextRelative = relative ? path.posix.join(relative, entry.name) : entry.name;
+    if (shouldExcludePath(nextRelative, exclude) && shouldExcludePath(nextRelative, TRANSIENT_WORKSPACE_EXCLUDES)) {
+      transient?.(nextRelative);
+      continue;
+    }
     if (shouldExcludePath(nextRelative, exclude) || ignored.matches(nextRelative)) continue;
     const fullPath = path.join(root, nextRelative);
     const stats = await fs.lstat(fullPath);
     if (stats.isDirectory()) {
       yield [nextRelative, { kind: "dir" }];
-      yield* walkDirectory(root, exclude, ignored, nextRelative);
+      yield* walkDirectory(root, exclude, ignored, transient, nextRelative);
     } else if (stats.isSymbolicLink()) {
       yield [nextRelative, { kind: "symlink", target: await fs.readlink(fullPath) }];
     } else if (stats.isFile()) {
@@ -575,22 +580,28 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
 
 export async function captureDirectorySnapshot(
   rootDir: string,
-  options: { exclude?: string[]; ignoredPaths?: WorkspacePaths; diskBacked?: boolean } = {},
+  options: { exclude?: string[]; ignoredPaths?: WorkspacePaths; diskBacked?: boolean; captureTransientOccupancy?: boolean; workspace?: boolean } = {},
 ): Promise<DirectorySnapshot> {
-  const exclude = [...new Set(options.exclude ?? [])];
+  const exclude = [...new Set([...(options.workspace ? TRANSIENT_WORKSPACE_EXCLUDES : []), ...(options.exclude ?? [])])];
   const ignored = workspacePathMatcher(options.ignoredPaths);
   let writer: WorkspaceManifestWriter | null = null;
   try {
     writer = options.diskBacked ? await createWorkspaceManifest("paperclip-workspace-baseline-") : null;
     const memory = new Map<string, SnapshotEntry>();
-    for await (const [relative, entry] of walkDirectory(rootDir, exclude, ignored)) {
+    const transientPaths: string[] = [];
+    const transient = options.captureTransientOccupancy ? (relative: string) => {
+      if (writer) writer.add("transient", relative);
+      else transientPaths.push(relative);
+    } : undefined;
+    for await (const [relative, entry] of walkDirectory(rootDir, exclude, ignored, transient)) {
       if (writer) writer.add("baseline", relative, JSON.stringify(entry));
       else memory.set(relative, entry);
     }
     const manifest = writer?.paths("baseline");
+    const occupancy = options.captureTransientOccupancy ? writer?.paths("transient") ?? transientPaths : undefined;
     writer?.close();
     const snapshot: DirectorySnapshot = {
-      exclude, ignoredPaths: options.ignoredPaths,
+      exclude, ignoredPaths: options.ignoredPaths, transientPaths: occupancy,
       entries: manifest ? new WorkspaceManifestMap(manifest, parseManifestEntry) : memory,
     };
     if (writer) ownedDirectorySnapshots.set(snapshot, path.dirname(writer.filePath));
@@ -604,16 +615,20 @@ export async function captureDirectorySnapshot(
 
 /** A disk-backed subset for independent nested-repository merges. */
 export async function selectDirectorySnapshot(snapshot: DirectorySnapshot, options: {
-  prefix?: string; omit?: string[]; exclude: string[]; ignoredPaths?: WorkspacePaths;
+  prefix?: string; omit?: string[]; exclude: string[]; ignoredPaths?: WorkspacePaths; workspace?: boolean;
 }): Promise<DirectorySnapshot> {
+  const exclude = [...new Set([...(options.workspace ? TRANSIENT_WORKSPACE_EXCLUDES : []), ...options.exclude])];
   const writer = await createWorkspaceManifest("paperclip-workspace-baseline-");
   try {
     for (const [relative, entry] of snapshot.entries) {
+      if (shouldExcludePath(relative, exclude)) continue;
       if (options.prefix && !relative.startsWith(options.prefix)) continue;
       if (options.omit?.some((omit) => relative === omit || relative.startsWith(`${omit}/`))) continue;
-      writer.add("baseline", options.prefix ? relative.slice(options.prefix.length) : relative, JSON.stringify(entry));
+      const selectedRelative = options.prefix ? relative.slice(options.prefix.length) : relative;
+      if (shouldExcludePath(selectedRelative, exclude)) continue;
+      writer.add("baseline", selectedRelative, JSON.stringify(entry));
     }
-    const result: DirectorySnapshot = { exclude: options.exclude, ignoredPaths: options.ignoredPaths,
+    const result: DirectorySnapshot = { exclude, ignoredPaths: options.ignoredPaths,
       entries: new WorkspaceManifestMap(writer.paths("baseline"), parseManifestEntry) };
     writer.close();
     ownedDirectorySnapshots.set(result, path.dirname(writer.filePath));
@@ -625,9 +640,13 @@ export async function selectDirectorySnapshot(snapshot: DirectorySnapshot, optio
   }
 }
 
-function orderedEntries(snapshot: DirectorySnapshot, reverse = false): Iterable<[string, SnapshotEntry]> {
-  if (snapshot.entries instanceof WorkspaceManifestMap) return snapshot.entries.entries(reverse);
-  return [...snapshot.entries].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0) * (reverse ? -1 : 1));
+function* orderedEntries(snapshot: DirectorySnapshot, reverse = false): Iterable<[string, SnapshotEntry]> {
+  const entries = snapshot.entries instanceof WorkspaceManifestMap
+    ? snapshot.entries.entries(reverse)
+    : [...snapshot.entries].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0) * (reverse ? -1 : 1));
+  for (const entry of entries) {
+    if (!shouldExcludePath(entry[0], snapshot.exclude)) yield entry;
+  }
 }
 
 export class DirectoryMergeConflict extends Error {
@@ -639,7 +658,8 @@ export class DirectoryMergeConflict extends Error {
 
 /** Preflight the entire delta before writing. Identical replays are safe after
  * an interrupted apply; unrelated edits are left alone. No history is retained. */
-export function directoryMergeConflicts(baseline: DirectorySnapshot, source: DirectorySnapshot, current: DirectorySnapshot): string[] {
+export function directoryMergeConflicts(baseline: DirectorySnapshot, source: DirectorySnapshot, current: DirectorySnapshot, options: { workspace?: boolean } = {}): string[] {
+  const transientExcludes = options.workspace ? [...TRANSIENT_WORKSPACE_EXCLUDES] : baseline.exclude.filter((entry) => (TRANSIENT_WORKSPACE_EXCLUDES as readonly string[]).includes(entry));
   const same = (a: SnapshotEntry | undefined, b: SnapshotEntry | undefined) =>
     (!a && !b) || entriesMatch(a, b);
   const conflicts = new Set<string>();
@@ -648,6 +668,7 @@ export function directoryMergeConflicts(baseline: DirectorySnapshot, source: Dir
     for (const [name] of source.entries) if (!baseline.entries.has(name)) yield name;
   }
   for (const relative of changedPaths()) {
+    if (shouldExcludePath(relative, baseline.exclude) || shouldExcludePath(relative, transientExcludes)) continue;
     const before = baseline.entries.get(relative);
     const incoming = source.entries.get(relative);
     const present = current.entries.get(relative);
@@ -661,14 +682,24 @@ export function directoryMergeConflicts(baseline: DirectorySnapshot, source: Dir
   }
   // Stream each current entry once. A replacement must not remove children
   // omitted from the baseline, including excluded or newly created files.
-  for (const [child, entry] of current.entries) {
-    if (same(entry, baseline.entries.get(child)) || same(entry, source.entries.get(child))) continue;
+  const protectChild = (child: string) => {
     for (let parent = path.posix.dirname(child); parent !== "."; parent = path.posix.dirname(parent)) {
-      if (baseline.entries.get(parent)?.kind === "dir" && source.entries.get(parent)?.kind !== "dir") {
+      if (shouldExcludePath(parent, transientExcludes)) continue;
+      if (source.entries.get(parent)?.kind !== "dir" &&
+          (baseline.entries.get(parent)?.kind === "dir" ||
+           (current.entries.get(parent)?.kind === "dir" && source.entries.has(parent)))) {
         conflicts.add(child);
         break;
       }
     }
+  };
+  for (const [child, entry] of current.entries) {
+    if (!shouldExcludePath(child, transientExcludes) &&
+        (same(entry, baseline.entries.get(child)) || same(entry, source.entries.get(child)))) continue;
+    protectChild(child);
+  }
+  if (current.transientPaths) {
+    for (const child of workspacePaths(current.transientPaths)) protectChild(child);
   }
   return [...conflicts].sort();
 }
@@ -678,10 +709,13 @@ export async function mergeDirectoryWithBaseline(input: {
   sourceDir: string;
   targetDir: string;
   conflictPolicy?: "reject";
+  workspace?: boolean;
   beforeApply?: () => Promise<void>;
   afterApply?: () => Promise<void>;
 }): Promise<void> {
-  const options = { exclude: input.baseline.exclude, ignoredPaths: input.baseline.ignoredPaths, diskBacked: true };
+  const baseline = input.workspace ? { ...input.baseline, exclude: [...new Set([...TRANSIENT_WORKSPACE_EXCLUDES, ...input.baseline.exclude])] } : input.baseline;
+  const options = { exclude: baseline.exclude, ignoredPaths: baseline.ignoredPaths, diskBacked: true };
+  const transientExclude = baseline.exclude.filter((entry) => (TRANSIENT_WORKSPACE_EXCLUDES as readonly string[]).includes(entry));
   const source = await captureDirectorySnapshot(input.sourceDir, options);
   try {
     await withDirectoryMergeLock(input.targetDir, async (canonicalTargetDir) => {
@@ -689,19 +723,19 @@ export async function mergeDirectoryWithBaseline(input: {
       // Strict preflight must see excluded children before a directory is
       // replaced. The merge still applies only the filtered source/baseline.
       const current = await captureDirectorySnapshot(canonicalTargetDir,
-        input.conflictPolicy === "reject" ? { exclude: [], diskBacked: true } : options);
+        input.conflictPolicy === "reject" ? { exclude: transientExclude, diskBacked: true, captureTransientOccupancy: true } : options);
       try {
         if (input.conflictPolicy === "reject") {
-          const conflicts = directoryMergeConflicts(input.baseline, source, current);
+          const conflicts = directoryMergeConflicts(baseline, source, current);
           if (conflicts.length) throw new DirectoryMergeConflict(conflicts);
         }
-        for (const [relative, baselineEntry] of orderedEntries(input.baseline)) {
+        for (const [relative, baselineEntry] of orderedEntries(baseline)) {
           if (baselineEntry.kind === "dir" || source.entries.has(relative)) continue;
           if (!entriesMatch(current.entries.get(relative), baselineEntry)) continue;
           await fs.rm(path.join(canonicalTargetDir, relative), { recursive: true, force: true });
         }
         // Reverse path order visits descendants before their parent directory.
-        for (const [relative, entry] of orderedEntries(input.baseline, true)) {
+        for (const [relative, entry] of orderedEntries(baseline, true)) {
           if (entry.kind === "dir" && !source.entries.has(relative)) await fs.rmdir(path.join(canonicalTargetDir, relative)).catch((error: NodeJS.ErrnoException) => {
             if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY" && error.code !== "ENOTDIR") throw error;
           });

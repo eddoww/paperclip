@@ -780,6 +780,7 @@ async function finalizePreparedRuntime(input: {
     await import("@paperclipai/adapter-utils/workspace-restore-merge").then(
       ({ captureDirectorySnapshot }) =>
         captureDirectorySnapshot(input.descriptor.binding.localCwd, {
+          workspace: true,
           exclude: input.runtime.workspaceSyncSnapshot?.baseline.exclude ?? [],
           ignoredPaths: input.runtime.workspaceSyncSnapshot?.baseline.ignoredPaths,
           diskBacked: true,

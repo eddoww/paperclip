@@ -4,7 +4,7 @@ import { constants as fsConstants, createReadStream, createWriteStream, promises
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { Transform } from "node:stream";
+import { Transform, pipeline } from "node:stream";
 import { shouldExcludePath, TRANSIENT_WORKSPACE_EXCLUDES } from "./exclude-patterns.js";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
 import {
@@ -415,21 +415,27 @@ function tarExcludeArgs(exclude: string[] | undefined): string[] {
 }
 
 function directoryArchiveScript(input: { exclude?: string[]; followSymlinks?: boolean }): string {
-  const patterns = ["._*", ...TRANSIENT_WORKSPACE_EXCLUDES, ...(input.exclude ?? [])]
-    .map((pattern) => pattern.replace(/^(\.\/)+/, ""));
+  const patterns = ["._*", ...TRANSIENT_WORKSPACE_EXCLUDES, ...(input.exclude ?? [])];
   const predicates = patterns.flatMap((pattern, index) => [
     ...(index > 0 ? ["-o"] : []),
-    ...(pattern.includes("/")
-      ? ["-path", shellQuote(`./${pattern}`), "-o", "-path", shellQuote(`*/${pattern}`)]
-      : ["-name", shellQuote(pattern)]),
+    ...(pattern.startsWith("./")
+      ? ["-path", shellQuote(`./${pattern.replace(/^(\.\/)+/, "")}`)]
+      : pattern.includes("/")
+        ? ["-path", shellQuote(`./${pattern}`), "-o", "-path", shellQuote(`*/${pattern}`)]
+        : ["-name", shellQuote(pattern)]),
   ]).join(" ");
   return [
     'members=$(mktemp "${TMPDIR:-/tmp}/paperclip-ssh-members.XXXXXX") || exit',
-    'trap \'rm -f "$members"\' EXIT HUP INT TERM',
+    'worker=',
+    'trap \'rm -f "$members"\' EXIT',
+    'terminate() { trap "" HUP INT TERM; if [ -n "$worker" ]; then kill -KILL "$worker" 2>/dev/null || :; wait "$worker" 2>/dev/null || :; fi; exit "$1"; }',
+    "trap 'terminate 129' HUP",
+    "trap 'terminate 130' INT",
+    "trap 'terminate 143' TERM",
     'members_dir=$(CDPATH= cd -- "$(dirname -- "$members")" && pwd -P) || exit',
     'members="$members_dir/$(basename -- "$members")"',
-    `find ${input.followSymlinks ? "-L " : ""}. \\( -samefile "$members" -o ${predicates} \\) -prune -o -print0 > "$members" || exit`,
-    `tar ${[...(input.followSymlinks ? ["-h"] : []), ...tarExcludeArgs(input.exclude).map(shellQuote), "--no-recursion", "--null", "-cf", "-", "-T", '"$members"'].join(" ")}; status=$?; exit "$status"`,
+    `find ${input.followSymlinks ? "-L " : ""}. \\( -samefile "$members" -o ${predicates} \\) -prune -o -print0 > "$members" & worker=$!; wait "$worker"; status=$?; worker=; [ "$status" -eq 0 ] || exit "$status"`,
+    `tar ${[...(input.followSymlinks ? ["-h"] : []), ...tarExcludeArgs(input.exclude).map(shellQuote), "--no-recursion", "--null", "-cf", "-", "-T", '"$members"'].join(" ")} & worker=$!; wait "$worker"; status=$?; worker=; exit "$status"`,
   ].join("; ");
 }
 
@@ -1421,23 +1427,18 @@ export async function syncDirectoryToSsh(input: {
       reject(error);
     };
 
-    tar.stdout?.on("error", fail);
-    tar.stdout?.on("close", () => {
-      if (!pipeFinished) fail(new Error("Archive source closed before stream ended."));
-    });
-    ssh.stdin?.on("error", fail);
-    ssh.stdin?.on("close", () => {
-      if (!tar.stdout?.readableEnded) fail(new Error("SSH transport closed before archive stream ended."));
-    });
-    tar.stdout?.on("end", () => {
+    const onPipelineFinished = (error: NodeJS.ErrnoException | null) => {
+      if (error) {
+        fail(error);
+        return;
+      }
       pipeFinished = true;
       maybeFinish();
-    });
+    };
     if (progress) {
-      progress.counter.on("error", fail);
-      tar.stdout?.pipe(progress.counter).pipe(ssh.stdin!);
+      pipeline(tar.stdout!, progress.counter, ssh.stdin!, onPipelineFinished);
     } else {
-      tar.stdout?.pipe(ssh.stdin!);
+      pipeline(tar.stdout!, ssh.stdin!, onPipelineFinished);
     }
     tar.stderr?.on("data", (chunk) => {
       tarStderr += String(chunk);
@@ -1556,23 +1557,18 @@ export async function syncDirectoryFromSsh(input: {
         reject(error);
       };
 
-      ssh.stdout?.on("error", fail);
-      ssh.stdout?.on("close", () => {
-        if (!pipeFinished) fail(new Error("SSH source closed before stream ended."));
-      });
-      tar.stdin?.on("error", fail);
-      tar.stdin?.on("close", () => {
-        if (!ssh.stdout?.readableEnded) fail(new Error("Archive destination closed before SSH stream ended."));
-      });
-      ssh.stdout?.on("end", () => {
+      const onPipelineFinished = (error: NodeJS.ErrnoException | null) => {
+        if (error) {
+          fail(error);
+          return;
+        }
         pipeFinished = true;
         maybeFinish();
-      });
+      };
       if (progress) {
-        progress.counter.on("error", fail);
-        ssh.stdout?.pipe(progress.counter).pipe(tar.stdin!);
+        pipeline(ssh.stdout!, progress.counter, tar.stdin!, onPipelineFinished);
       } else {
-        ssh.stdout?.pipe(tar.stdin!);
+        pipeline(ssh.stdout!, tar.stdin!, onPipelineFinished);
       }
       ssh.stderr?.on("data", (chunk) => {
         sshStderr += String(chunk);

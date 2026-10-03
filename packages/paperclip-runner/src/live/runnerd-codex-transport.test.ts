@@ -7470,6 +7470,12 @@ it.each([true, false])("preserves prepared OpenCode cleanup errors (primary fail
 
 it("preserves prepared input through runnerd and the real OpenCode proxy boundary", async () => {
   const root = await mkdtemp(join(tmpdir(), "runnerd-prepared-opencode-"));
+  const nodeCommand = join(root, "node");
+  await cp(process.execPath, nodeCommand);
+  await chmod(nodeCommand, 0o755);
+  if (process.platform !== "win32") {
+    expect((await stat(nodeCommand)).mode & 0o022).toBe(0);
+  }
   // The qualified launch boundary unlinks its executable after exec. Use a
   // native wrapper, like the real OpenCode binary; a shebang script would need
   // to reopen the now-unlinked path in its interpreter.
@@ -7501,8 +7507,8 @@ it("preserves prepared input through runnerd and the real OpenCode proxy boundar
     opencodeCommandSha256: digest(executable),
     opencodeProxyPath: proxy,
     opencodeProxySha256: digest(proxy),
-    providerNodeCommand: process.execPath,
-    providerNodeCommandSha256: digest(process.execPath),
+    providerNodeCommand: nodeCommand,
+    providerNodeCommandSha256: digest(nodeCommand),
     environment: { PATH: process.env.PATH, OPENROUTER_API_KEY: "fixture-key" },
   });
   const task = createCodexTaskEnvelope({

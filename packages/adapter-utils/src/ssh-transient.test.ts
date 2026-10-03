@@ -1,5 +1,7 @@
-import { spawn } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { expect, it, vi } from "vitest";
@@ -11,14 +13,117 @@ vi.mock("node:child_process", async (importOriginal) => {
   return { ...actual, spawn: vi.fn(actual.spawn) };
 });
 
+const gnuTar = (() => {
+  try {
+    return execFileSync("tar", ["--version"], { encoding: "utf8" }).includes("GNU tar");
+  } catch {
+    return false;
+  }
+})();
+const realTarIt = it.skipIf(!gnuTar);
+const enforcesReadPermissions = (() => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "paperclip-readability-"));
+  try {
+    const file = path.join(root, "unreadable");
+    writeFileSync(file, "probe", { mode: 0o000 });
+    try {
+      readFileSync(file);
+      return false;
+    } catch {
+      return true;
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+})();
+
+realTarIt.each(((["to", "from"] as const).flatMap((direction) =>
+  ["", "./", "tmp/../tmp/", "alias/"].flatMap((tmp) => ["./a/cache", "a/cache"].map((exclude) => ({ direction, tmp, exclude }))),
+)))("$direction prunes $exclude and exact manifest with TMPDIR '$tmp'", async ({ direction, tmp, exclude }) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-manifest-"));
+  const source = path.join(root, "source");
+  const destination = path.join(root, "destination");
+  const { spawn: actualSpawn } = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+  const spy = vi.mocked(spawn).mockImplementation(((command: string, args: readonly string[], options: import("node:child_process").SpawnOptions) =>
+    command === "ssh" ? actualSpawn("sh", ["-c", String(args.at(-1))], { ...options, env: { ...process.env, TMPDIR: tmp || source } }) : actualSpawn(command, args, { ...options, env: { ...options.env, TMPDIR: tmp || source } })
+  ) as typeof spawn);
+  try {
+    await fs.mkdir(path.join(source, "a/cache"), { recursive: true });
+    await fs.writeFile(path.join(source, "a/cache/volatile"), "excluded");
+    await fs.chmod(path.join(source, "a/cache"), 0o000);
+    await fs.mkdir(path.join(source, "tmp"));
+    await fs.symlink("tmp", path.join(source, "alias"));
+    await fs.writeFile(path.join(source, "tmp/paperclip-ssh-members.keep"), "keep");
+    await fs.writeFile(path.join(source, "payload"), Buffer.alloc(256 * 1024, 65));
+    const spec = { host: "localhost", port: 22, username: "fixture", remoteCwd: root, remoteWorkspacePath: root, privateKey: null, knownHosts: null, strictHostKeyChecking: false } as const;
+    await (direction === "to"
+      ? syncDirectoryToSsh({ spec, localDir: source, remoteDir: destination, exclude: [exclude] })
+      : syncDirectoryFromSsh({ spec, remoteDir: source, localDir: destination, exclude: [exclude] }));
+    await expect(fs.stat(path.join(destination, "a/cache"))).rejects.toMatchObject({ code: "ENOENT" });
+    const names = [...await fs.readdir(destination), ...await fs.readdir(path.join(destination, "tmp"))];
+    expect(names.filter((name) => name.startsWith("paperclip-ssh-members."))).toEqual(["paperclip-ssh-members.keep"]);
+  } finally {
+    spy.mockRestore();
+    await fs.chmod(path.join(source, "a/cache"), 0o700).catch(() => undefined);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 it.each((["to", "from"] as const).flatMap((direction) =>
+  ["source-signal", "destination-signal", "early-close", "source-close", "stdin-error"].flatMap((failure) => [false, true].map((progress) => ({ direction, failure, progress }))),
+))("$direction rejects $failure (progress=$progress) and preserves download target", async ({ direction, failure, progress }) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-stream-"));
+  const destination = path.join(root, "destination");
+  const children: Array<EventEmitter & { stdin: PassThrough; stdout: PassThrough; stderr: PassThrough; kill: ReturnType<typeof vi.fn> }> = [];
+  const spy = vi.mocked(spawn).mockImplementation((() => {
+    const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn() });
+    children.push(child);
+    if (children.length === 2) setImmediate(() => {
+      const source = children[0]!;
+      const sink = children[1]!;
+      if (failure === "source-close") {
+        source.stdout.destroy();
+      } else if (failure === "stdin-error") {
+        sink.stdin.destroy(new Error("destination stdin failed"));
+      } else if (failure === "early-close") {
+        sink.stdin.destroy();
+        sink.emit("close", 0, null);
+      } else {
+        source.stdout.end();
+        source.emit("close", failure === "source-signal" ? null : 0, failure === "source-signal" ? "SIGTERM" : null);
+        sink.emit("close", failure === "destination-signal" ? null : 0, failure === "destination-signal" ? "SIGTERM" : null);
+      }
+    });
+    return child;
+  }) as unknown as typeof spawn);
+  try {
+    await fs.mkdir(destination);
+    await fs.writeFile(path.join(destination, "preserve"), "local");
+    const spec = { host: "localhost", port: 22, username: "fixture", remoteCwd: root, remoteWorkspacePath: root, privateKey: null, knownHosts: null, strictHostKeyChecking: false } as const;
+    await expect(direction === "to"
+      ? syncDirectoryToSsh({ spec, localDir: root, remoteDir: destination, onProgress: progress ? () => undefined : undefined })
+      : syncDirectoryFromSsh({ spec, remoteDir: root, localDir: destination, onProgress: progress ? () => undefined : undefined })
+    ).rejects.toThrow();
+    expect(await fs.readFile(path.join(destination, "preserve"), "utf8")).toBe("local");
+  } finally {
+    spy.mockRestore();
+    for (const child of children) {
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}, 2_000);
+
+realTarIt.each((["to", "from"] as const).flatMap((direction) =>
   ["", "a/b/c"].map((relative) => ({ direction, relative })),
 ))("$direction SSH archives tolerate excluded churn in '$relative'", async ({ direction, relative }) => {
   await withConcurrentTar(direction, relative, "excluded");
 }, 30_000);
 
-it.each((["to", "from"] as const).flatMap((direction) =>
-  (["included", "read", "transport"] as const).map((failure) => ({ direction, failure })),
+realTarIt.each((["to", "from"] as const).flatMap((direction) =>
+  (["included", "read", "transport"] as const).filter((failure) => failure !== "read" || enforcesReadPermissions).map((failure) => ({ direction, failure })),
 ))("$direction SSH archives reject $failure failures", async ({ direction, failure }) => {
   await withConcurrentTar(direction, "a/b/c", failure);
 }, 30_000);
@@ -49,17 +154,19 @@ async function withConcurrentTar(direction: "to" | "from", relative: string, mod
     await fs.writeFile(path.join(dir, "unreadable"), "must be read", { mode: mode === "read" ? 0o000 : 0o600 });
     await fs.symlink("payload", path.join(dir, "link"));
     await fs.writeFile(path.join(dir, "skip"), "excluded by caller");
+    await fs.mkdir(path.join(dir, "cache"));
+    await fs.writeFile(path.join(dir, "cache", "volatile"), "excluded by caller");
     const mutation = mode === "included"
       ? `printf changed >> ${shellQuote(payload)}`
       : mode === "read" || mode === "transport"
         ? "true"
-        : `touch ${shellQuote(path.join(dir, ".paperclip-merge-churn"))}; rm -f ${shellQuote(path.join(dir, ".paperclip-merge-churn"))}`;
+        : `touch ${shellQuote(path.join(dir, "cache", "churn"))}; rm -f ${shellQuote(path.join(dir, "cache", "churn"))}; touch ${shellQuote(path.join(dir, ".paperclip-merge-churn"))}; rm -f ${shellQuote(path.join(dir, ".paperclip-merge-churn"))}`;
     await fs.writeFile(action, `#!/bin/sh\nif [ "$TAR_SUBCOMMAND" = "-c" ]${mode === "included" ? "" : ` && [ ! -e ${shellQuote(marker)} ]`}; then touch ${shellQuote(marker)}; ${mutation}; fi\n`, { mode: 0o700 });
     process.env.TAR_OPTIONS = `--checkpoint=${mode === "included" ? 4 : 1} --checkpoint-action=exec=${action}`;
     const spec = { host: "localhost", port: 22, username: "fixture", remoteCwd: root, remoteWorkspacePath: root, privateKey: null, knownHosts: null, strictHostKeyChecking: false } as const;
     const transfer = direction === "to"
-      ? syncDirectoryToSsh({ spec, localDir: source, remoteDir: destination, exclude: ["skip"] })
-      : syncDirectoryFromSsh({ spec, remoteDir: source, localDir: destination, exclude: ["skip"], preserveLocalEntries: ["preserve"] });
+      ? syncDirectoryToSsh({ spec, localDir: source, remoteDir: destination, exclude: ["skip", `./${relative ? `${relative}/` : ""}cache`] })
+      : syncDirectoryFromSsh({ spec, remoteDir: source, localDir: destination, exclude: ["skip", `./${relative ? `${relative}/` : ""}cache`], preserveLocalEntries: ["preserve"] });
     if (mode !== "excluded") {
       await expect(transfer, `${direction}: ${mode}`).rejects.toThrow(mode === "included" ? /file changed as we read it/ : mode === "read" ? /Cannot open|Permission denied/ : /transport failed/);
       if (direction === "from") expect(await fs.readFile(path.join(destination, "preserve"), "utf8")).toBe("local");
@@ -81,7 +188,7 @@ async function withConcurrentTar(direction: "to" | "from", relative: string, mod
   }
 }
 
-it("follows file and directory symlinks only when requested and handles NUL-listed names", async () => {
+realTarIt("follows file and directory symlinks only when requested and handles NUL-listed names", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-tar-links-"));
   const source = path.join(root, "source");
   const external = path.join(root, "external");
@@ -111,7 +218,7 @@ it("follows file and directory symlinks only when requested and handles NUL-list
   }
 });
 
-it.each(["to", "from"] as const)("%s SSH archives reject a missing source directory", async (direction) => {
+realTarIt.each(["to", "from"] as const)("%s SSH archives reject a missing source directory", async (direction) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-tar-missing-"));
   const { spawn: actualSpawn } = await vi.importActual<typeof import("node:child_process")>("node:child_process");
   const spawnSpy = vi.mocked(spawn).mockImplementation(((command: string, args: readonly string[], options: import("node:child_process").SpawnOptions) =>
@@ -145,7 +252,7 @@ it("matches only literal basename-prefix globs at any depth", () => {
   expect(excludePatternMatches("a/cache-file", "cache-?*")).toBe(false);
 });
 
-it("excludes transient paths from real upload and download tar and size estimation", async () => {
+realTarIt("excludes transient paths from real upload and download tar and size estimation", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-tar-transient-"));
   const source = path.join(root, "source");
   const uploaded = path.join(root, "uploaded");

@@ -8,6 +8,7 @@ import {
 import os from "node:os";
 import { workspacePaths, workspacePathMatcher, writeWorkspacePaths, isPathManifest, type WorkspacePaths } from "./workspace-manifest.js";
 import path from "node:path";
+import { TRANSIENT_WORKSPACE_EXCLUDES } from "./exclude-patterns.js";
 import { promisify } from "node:util";
 import {
   buildRemoteGitDeltaBundleScript,
@@ -1205,12 +1206,14 @@ export async function prepareSandboxManagedRuntime(input: {
   }
   const gitIgnoredExcludes = directoryIgnore?.kind === "git" ? directoryIgnore.ignoredPaths : undefined;
   const workspaceArchiveExclude = mergeExcludes(
+    [...TRANSIENT_WORKSPACE_EXCLUDES],
     input.workspaceFileMode === "all" ? [] : SANDBOX_WORKSPACE_HEAVY_DIR_EXCLUDES,
     input.workspaceFileMode === "all" ? [] : [...GIT_ARCHIVE_EXCLUDES],
     input.workspaceExclude,
     gitIgnoredExcludes,
   );
   const restoreExclude = mergeExcludes(
+    [...TRANSIENT_WORKSPACE_EXCLUDES],
     input.workspaceFileMode === "all" ? [] : SANDBOX_WORKSPACE_HEAVY_DIR_EXCLUDES,
     input.workspaceFileMode === "all" ? [] : [...GIT_ARCHIVE_EXCLUDES],
     [".paperclip-runtime"],
@@ -1228,6 +1231,7 @@ export async function prepareSandboxManagedRuntime(input: {
     ? (input.workspaceBaseline ??
       (await runStepSpan("snapshot.baseline", () =>
         captureDirectorySnapshot(input.workspaceLocalDir, {
+          workspace: true,
           exclude: restoreExclude,
           ignoredPaths: gitSnapshot?.ignoredPaths,
           diskBacked: true,
@@ -1753,6 +1757,7 @@ export async function prepareSandboxManagedRuntime(input: {
                 workspaceGitSnapshot: repository.snapshot,
                 workspaceExclude: nestedExclude,
                 workspaceBaseline: await selectDirectorySnapshot(baselineSnapshot!, {
+                  workspace: true,
                   prefix,
                   exclude: mergeExcludes(SANDBOX_WORKSPACE_HEAVY_DIR_EXCLUDES, [...GIT_ARCHIVE_EXCLUDES], [".paperclip-runtime"], nestedExclude),
                   ignoredPaths: repository.snapshot.ignoredPaths,
@@ -1918,10 +1923,12 @@ export async function prepareSandboxManagedRuntime(input: {
                 }
                 const gitHeadToIntegrate = importedHead;
                 const mergeBaseline = repositories.length === 0 ? baselineSnapshot! : await selectDirectorySnapshot(baselineSnapshot!, {
+                  workspace: true,
                   omit: repositories.map((repo) => repo.path), exclude: workspaceRestoreExclude, ignoredPaths: gitSnapshot?.ignoredPaths,
                 });
                 try {
                 await mergeDirectoryWithBaseline({
+                  workspace: true,
                   baseline: mergeBaseline,
                   sourceDir: extractedDir,
                   targetDir: input.workspaceLocalDir,

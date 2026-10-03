@@ -87,7 +87,7 @@ describe("workspace restore merge", () => {
       }
     })();
     try {
-      baseline = await captureDirectorySnapshot(targetDir, { exclude: [], diskBacked, captureTransientOccupancy: true });
+      baseline = await captureDirectorySnapshot(targetDir, { workspace: true, exclude: [], diskBacked, captureTransientOccupancy: true });
       const occupancy = [...workspacePaths(baseline.transientPaths!)];
       for (const relative of transient) {
         expect(baseline.entries.has(relative)).toBe(false);
@@ -119,12 +119,12 @@ describe("workspace restore merge", () => {
       ["repos/deep/.git/lfs/tmp", { kind: "dir" }],
       ["repos/deep/.git/lfs/objects", { kind: "dir" }],
     ] })!;
-    const selected = await selectDirectorySnapshot(baseline, { prefix: "repos/deep/", exclude: [] });
+    const selected = await selectDirectorySnapshot(baseline, { workspace: true, prefix: "repos/deep/", exclude: [] });
     try {
       expect([...selected.entries].map(([relative]) => relative)).toEqual([".git/lfs/objects"]);
       await mkdir(path.join(targetDir, ".paperclip-merge-legacy"));
       await mkdir(path.join(sourceDir, ".paperclip-merge-incoming"));
-      await mergeDirectoryWithBaseline({ baseline, sourceDir, targetDir, conflictPolicy });
+      await mergeDirectoryWithBaseline({ baseline, sourceDir, targetDir, conflictPolicy, workspace: true });
       expect((await lstat(path.join(targetDir, ".paperclip-merge-legacy"))).isDirectory()).toBe(true);
       await expect(lstat(path.join(targetDir, ".paperclip-merge-incoming"))).rejects.toMatchObject({ code: "ENOENT" });
     } finally { await disposeDirectorySnapshot(selected); }
@@ -139,7 +139,7 @@ describe("workspace restore merge", () => {
     const source = parseDirectorySnapshot({ version: 1, exclude: [], entries: [
       ["parent", kind === "file" ? child : { kind: "symlink", target: "elsewhere" }], [transient, child],
     ] })!;
-    expect(directoryMergeConflicts(baseline, source, baseline)).toEqual([transient]);
+    expect(directoryMergeConflicts(baseline, source, baseline, { workspace: true })).toEqual([transient]);
     const nested = parseDirectorySnapshot({ version: 1, exclude: [], entries: [
       ["parent", { kind: "dir" }], [transient, { kind: "dir" }], [`${transient}/child`, child],
     ] })!;
@@ -162,7 +162,7 @@ describe("workspace restore merge", () => {
     await writeFile(path.join(targetDir, transient, "unreadable"), "preserve");
     await chmod(path.join(targetDir, transient, "unreadable"), 0);
     await mkdir(sourceDir);
-    const captured = await captureDirectorySnapshot(targetDir, { exclude: [], diskBacked: !legacy });
+    const captured = await captureDirectorySnapshot(targetDir, { workspace: true, exclude: [], diskBacked: !legacy });
     const baseline = legacy ? parseDirectorySnapshot({ version: 1, exclude: [], entries: [
       ...captured.entries, [transient, { kind: "dir" }],
       [`${transient}/unreadable`, { kind: "file", mode: 0o100000, hash: "a".repeat(64) }],
@@ -176,13 +176,48 @@ describe("workspace restore merge", () => {
       return actualOpendir(...args);
     }) as typeof fsPromises.opendir);
     try {
-      await expect(mergeDirectoryWithBaseline({ baseline, sourceDir, targetDir, conflictPolicy: "reject" })).rejects.toBeInstanceOf(DirectoryMergeConflict);
+      await expect(mergeDirectoryWithBaseline({ baseline, sourceDir, targetDir, conflictPolicy: "reject", workspace: true })).rejects.toBeInstanceOf(DirectoryMergeConflict);
       expect((await lstat(path.join(targetDir, "parent"))).isDirectory()).toBe(true);
       await chmod(path.join(targetDir, transient, "unreadable"), 0o600);
       expect(await readFile(path.join(targetDir, transient, "unreadable"), "utf8")).toBe("preserve");
       await expect(lstat(path.join(targetDir, "unrelated"))).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       spy.mockRestore();
+      await disposeDirectorySnapshot(captured);
+    }
+  });
+
+  it.each([false, true].flatMap((diskBacked) => [undefined, "reject"].map((conflictPolicy) => ({ diskBacked, conflictPolicy: conflictPolicy as "reject" | undefined }))))("preserves generic transient-looking files (diskBacked=$diskBacked, policy=$conflictPolicy)", async ({ diskBacked, conflictPolicy }) => {
+    const root = await mkdtemp(path.join(process.env.PAPERCLIP_RUN_SCRATCH_DIR ?? os.tmpdir(), "paperclip-generic-snapshot-"));
+    cleanupDirs.push(root);
+    const targetDir = path.join(root, "target");
+    const sourceDir = path.join(root, "source");
+    const files = [".paperclip-merge-notes.md", "nested/.paperclip-merge-notes.md", ".git/lfs/tmp/allowed", "nested/.git/lfs/tmp/allowed"];
+    for (const dir of [targetDir, sourceDir]) {
+      for (const relative of files) {
+        await mkdir(path.dirname(path.join(dir, relative)), { recursive: true });
+        await writeFile(path.join(dir, relative), "original");
+      }
+    }
+    const captured = await captureDirectorySnapshot(targetDir, { diskBacked });
+    const baseline = diskBacked ? captured : parseDirectorySnapshot(serializeDirectorySnapshot(captured))!;
+    const selected = await selectDirectorySnapshot(baseline, { prefix: "nested/", exclude: [] });
+    try {
+      expect(baseline.exclude).toEqual([]);
+      for (const relative of files) expect(baseline.entries.has(relative)).toBe(true);
+      expect(selected.entries.has(".paperclip-merge-notes.md")).toBe(true);
+      expect(selected.entries.has(".git/lfs/tmp/allowed")).toBe(true);
+      for (const relative of files) await writeFile(path.join(sourceDir, relative), "edited");
+      await mergeDirectoryWithBaseline({ baseline, sourceDir, targetDir, conflictPolicy });
+      for (const relative of files) expect(await readFile(path.join(targetDir, relative), "utf8")).toBe("edited");
+      await rm(path.join(sourceDir, files[0]));
+      await mergeDirectoryWithBaseline({ baseline, sourceDir, targetDir });
+      expect(await readFile(path.join(targetDir, files[0]), "utf8")).toBe("edited");
+      await writeFile(path.join(sourceDir, files[0]), "edited");
+      await writeFile(path.join(sourceDir, files[1]), "incoming");
+      await expect(mergeDirectoryWithBaseline({ baseline, sourceDir, targetDir, conflictPolicy: "reject" })).rejects.toMatchObject({ paths: [files[1]] });
+    } finally {
+      await disposeDirectorySnapshot(selected);
       await disposeDirectorySnapshot(captured);
     }
   });

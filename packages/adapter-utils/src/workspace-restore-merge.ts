@@ -149,7 +149,7 @@ async function* walkDirectory(
   const current = relative ? path.join(root, relative) : root;
   for await (const entry of await fs.opendir(current)) {
     const nextRelative = relative ? path.posix.join(relative, entry.name) : entry.name;
-    if (shouldExcludePath(nextRelative, TRANSIENT_WORKSPACE_EXCLUDES)) {
+    if (shouldExcludePath(nextRelative, exclude) && shouldExcludePath(nextRelative, TRANSIENT_WORKSPACE_EXCLUDES)) {
       transient?.(nextRelative);
       continue;
     }
@@ -580,9 +580,9 @@ async function copySnapshotEntry(sourceDir: string, targetDir: string, relative:
 
 export async function captureDirectorySnapshot(
   rootDir: string,
-  options: { exclude?: string[]; ignoredPaths?: WorkspacePaths; diskBacked?: boolean; captureTransientOccupancy?: boolean } = {},
+  options: { exclude?: string[]; ignoredPaths?: WorkspacePaths; diskBacked?: boolean; captureTransientOccupancy?: boolean; workspace?: boolean } = {},
 ): Promise<DirectorySnapshot> {
-  const exclude = [...new Set([...TRANSIENT_WORKSPACE_EXCLUDES, ...(options.exclude ?? [])])];
+  const exclude = [...new Set([...(options.workspace ? TRANSIENT_WORKSPACE_EXCLUDES : []), ...(options.exclude ?? [])])];
   const ignored = workspacePathMatcher(options.ignoredPaths);
   let writer: WorkspaceManifestWriter | null = null;
   try {
@@ -615,17 +615,17 @@ export async function captureDirectorySnapshot(
 
 /** A disk-backed subset for independent nested-repository merges. */
 export async function selectDirectorySnapshot(snapshot: DirectorySnapshot, options: {
-  prefix?: string; omit?: string[]; exclude: string[]; ignoredPaths?: WorkspacePaths;
+  prefix?: string; omit?: string[]; exclude: string[]; ignoredPaths?: WorkspacePaths; workspace?: boolean;
 }): Promise<DirectorySnapshot> {
-  const exclude = [...new Set([...TRANSIENT_WORKSPACE_EXCLUDES, ...options.exclude])];
+  const exclude = [...new Set([...(options.workspace ? TRANSIENT_WORKSPACE_EXCLUDES : []), ...options.exclude])];
   const writer = await createWorkspaceManifest("paperclip-workspace-baseline-");
   try {
     for (const [relative, entry] of snapshot.entries) {
-      if (shouldExcludePath(relative, TRANSIENT_WORKSPACE_EXCLUDES)) continue;
+      if (shouldExcludePath(relative, exclude)) continue;
       if (options.prefix && !relative.startsWith(options.prefix)) continue;
       if (options.omit?.some((omit) => relative === omit || relative.startsWith(`${omit}/`))) continue;
       const selectedRelative = options.prefix ? relative.slice(options.prefix.length) : relative;
-      if (shouldExcludePath(selectedRelative, TRANSIENT_WORKSPACE_EXCLUDES)) continue;
+      if (shouldExcludePath(selectedRelative, exclude)) continue;
       writer.add("baseline", selectedRelative, JSON.stringify(entry));
     }
     const result: DirectorySnapshot = { exclude, ignoredPaths: options.ignoredPaths,
@@ -645,7 +645,7 @@ function* orderedEntries(snapshot: DirectorySnapshot, reverse = false): Iterable
     ? snapshot.entries.entries(reverse)
     : [...snapshot.entries].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0) * (reverse ? -1 : 1));
   for (const entry of entries) {
-    if (!shouldExcludePath(entry[0], TRANSIENT_WORKSPACE_EXCLUDES)) yield entry;
+    if (!shouldExcludePath(entry[0], snapshot.exclude)) yield entry;
   }
 }
 
@@ -658,7 +658,8 @@ export class DirectoryMergeConflict extends Error {
 
 /** Preflight the entire delta before writing. Identical replays are safe after
  * an interrupted apply; unrelated edits are left alone. No history is retained. */
-export function directoryMergeConflicts(baseline: DirectorySnapshot, source: DirectorySnapshot, current: DirectorySnapshot): string[] {
+export function directoryMergeConflicts(baseline: DirectorySnapshot, source: DirectorySnapshot, current: DirectorySnapshot, options: { workspace?: boolean } = {}): string[] {
+  const transientExcludes = options.workspace ? [...TRANSIENT_WORKSPACE_EXCLUDES] : baseline.exclude.filter((entry) => (TRANSIENT_WORKSPACE_EXCLUDES as readonly string[]).includes(entry));
   const same = (a: SnapshotEntry | undefined, b: SnapshotEntry | undefined) =>
     (!a && !b) || entriesMatch(a, b);
   const conflicts = new Set<string>();
@@ -667,7 +668,7 @@ export function directoryMergeConflicts(baseline: DirectorySnapshot, source: Dir
     for (const [name] of source.entries) if (!baseline.entries.has(name)) yield name;
   }
   for (const relative of changedPaths()) {
-    if (shouldExcludePath(relative, TRANSIENT_WORKSPACE_EXCLUDES)) continue;
+    if (shouldExcludePath(relative, baseline.exclude) || shouldExcludePath(relative, transientExcludes)) continue;
     const before = baseline.entries.get(relative);
     const incoming = source.entries.get(relative);
     const present = current.entries.get(relative);
@@ -683,7 +684,7 @@ export function directoryMergeConflicts(baseline: DirectorySnapshot, source: Dir
   // omitted from the baseline, including excluded or newly created files.
   const protectChild = (child: string) => {
     for (let parent = path.posix.dirname(child); parent !== "."; parent = path.posix.dirname(parent)) {
-      if (shouldExcludePath(parent, TRANSIENT_WORKSPACE_EXCLUDES)) continue;
+      if (shouldExcludePath(parent, transientExcludes)) continue;
       if (source.entries.get(parent)?.kind !== "dir" &&
           (baseline.entries.get(parent)?.kind === "dir" ||
            (current.entries.get(parent)?.kind === "dir" && source.entries.has(parent)))) {
@@ -693,7 +694,7 @@ export function directoryMergeConflicts(baseline: DirectorySnapshot, source: Dir
     }
   };
   for (const [child, entry] of current.entries) {
-    if (!shouldExcludePath(child, TRANSIENT_WORKSPACE_EXCLUDES) &&
+    if (!shouldExcludePath(child, transientExcludes) &&
         (same(entry, baseline.entries.get(child)) || same(entry, source.entries.get(child)))) continue;
     protectChild(child);
   }
@@ -708,10 +709,13 @@ export async function mergeDirectoryWithBaseline(input: {
   sourceDir: string;
   targetDir: string;
   conflictPolicy?: "reject";
+  workspace?: boolean;
   beforeApply?: () => Promise<void>;
   afterApply?: () => Promise<void>;
 }): Promise<void> {
-  const options = { exclude: input.baseline.exclude, ignoredPaths: input.baseline.ignoredPaths, diskBacked: true };
+  const baseline = input.workspace ? { ...input.baseline, exclude: [...new Set([...TRANSIENT_WORKSPACE_EXCLUDES, ...input.baseline.exclude])] } : input.baseline;
+  const options = { exclude: baseline.exclude, ignoredPaths: baseline.ignoredPaths, diskBacked: true };
+  const transientExclude = baseline.exclude.filter((entry) => (TRANSIENT_WORKSPACE_EXCLUDES as readonly string[]).includes(entry));
   const source = await captureDirectorySnapshot(input.sourceDir, options);
   try {
     await withDirectoryMergeLock(input.targetDir, async (canonicalTargetDir) => {
@@ -719,19 +723,19 @@ export async function mergeDirectoryWithBaseline(input: {
       // Strict preflight must see excluded children before a directory is
       // replaced. The merge still applies only the filtered source/baseline.
       const current = await captureDirectorySnapshot(canonicalTargetDir,
-        input.conflictPolicy === "reject" ? { exclude: [], diskBacked: true, captureTransientOccupancy: true } : options);
+        input.conflictPolicy === "reject" ? { exclude: transientExclude, diskBacked: true, captureTransientOccupancy: true } : options);
       try {
         if (input.conflictPolicy === "reject") {
-          const conflicts = directoryMergeConflicts(input.baseline, source, current);
+          const conflicts = directoryMergeConflicts(baseline, source, current);
           if (conflicts.length) throw new DirectoryMergeConflict(conflicts);
         }
-        for (const [relative, baselineEntry] of orderedEntries(input.baseline)) {
+        for (const [relative, baselineEntry] of orderedEntries(baseline)) {
           if (baselineEntry.kind === "dir" || source.entries.has(relative)) continue;
           if (!entriesMatch(current.entries.get(relative), baselineEntry)) continue;
           await fs.rm(path.join(canonicalTargetDir, relative), { recursive: true, force: true });
         }
         // Reverse path order visits descendants before their parent directory.
-        for (const [relative, entry] of orderedEntries(input.baseline, true)) {
+        for (const [relative, entry] of orderedEntries(baseline, true)) {
           if (entry.kind === "dir" && !source.entries.has(relative)) await fs.rmdir(path.join(canonicalTargetDir, relative)).catch((error: NodeJS.ErrnoException) => {
             if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY" && error.code !== "ENOTDIR") throw error;
           });

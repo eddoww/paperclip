@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -50,6 +50,8 @@ realTarIt.each(((["to", "from"] as const).flatMap((direction) =>
   try {
     await fs.mkdir(path.join(source, "a/cache"), { recursive: true });
     await fs.writeFile(path.join(source, "a/cache/volatile"), "excluded");
+    await fs.mkdir(path.join(source, "nested/project/a/cache"), { recursive: true });
+    await fs.writeFile(path.join(source, "nested/project/a/cache/keep"), "lookalike");
     await fs.chmod(path.join(source, "a/cache"), 0o000);
     await fs.mkdir(path.join(source, "tmp"));
     await fs.symlink("tmp", path.join(source, "alias"));
@@ -60,6 +62,11 @@ realTarIt.each(((["to", "from"] as const).flatMap((direction) =>
       ? syncDirectoryToSsh({ spec, localDir: source, remoteDir: destination, exclude: [exclude] })
       : syncDirectoryFromSsh({ spec, remoteDir: source, localDir: destination, exclude: [exclude] }));
     await expect(fs.stat(path.join(destination, "a/cache"))).rejects.toMatchObject({ code: "ENOENT" });
+    if (exclude.startsWith("./")) {
+      expect(await fs.readFile(path.join(destination, "nested/project/a/cache/keep"), "utf8")).toBe("lookalike");
+    } else {
+      await expect(fs.stat(path.join(destination, "nested/project/a/cache"))).rejects.toMatchObject({ code: "ENOENT" });
+    }
     const names = [...await fs.readdir(destination), ...await fs.readdir(path.join(destination, "tmp"))];
     expect(names.filter((name) => name.startsWith("paperclip-ssh-members."))).toEqual(["paperclip-ssh-members.keep"]);
   } finally {
@@ -115,6 +122,92 @@ it.each((["to", "from"] as const).flatMap((direction) =>
     await fs.rm(root, { recursive: true, force: true });
   }
 }, 2_000);
+
+it.each((["to", "from"] as const).flatMap((direction) =>
+  [false, true].flatMap((progress) => [false, true].map((close) => ({ direction, progress, close }))),
+))("$direction waits for stalled destination after EOF (progress=$progress, close=$close)", async ({ direction, progress, close }) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-stalled-"));
+  const destination = path.join(root, "destination");
+  const children: Array<EventEmitter & { stdin: Writable; stdout: PassThrough; stderr: PassThrough; kill: ReturnType<typeof vi.fn> }> = [];
+  let release: (() => void) | undefined;
+  const sink = new Writable({ write(_chunk, _encoding, callback) { release = callback; } });
+  const spy = vi.mocked(spawn).mockImplementation((() => {
+    const child = Object.assign(new EventEmitter(), { stdin: children.length === 1 ? sink : new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn() });
+    children.push(child);
+    return child;
+  }) as unknown as typeof spawn);
+  try {
+    await fs.mkdir(destination);
+    await fs.writeFile(path.join(destination, "preserve"), "local");
+    const spec = { host: "localhost", port: 22, username: "fixture", remoteCwd: root, remoteWorkspacePath: root, privateKey: null, knownHosts: null, strictHostKeyChecking: false } as const;
+    let settled = false;
+    const transfer = (direction === "to"
+      ? syncDirectoryToSsh({ spec, localDir: root, remoteDir: destination, onProgress: progress ? () => undefined : undefined })
+      : syncDirectoryFromSsh({ spec, remoteDir: root, localDir: destination, onProgress: progress ? () => undefined : undefined }));
+    const outcome = transfer.then(() => { settled = true; return null; }, (error: unknown) => { settled = true; return error; });
+    await vi.waitFor(() => expect(children).toHaveLength(2));
+    children[0]!.stdout.end(Buffer.alloc(1024));
+    await vi.waitFor(() => expect(children[0]!.stdout.readableEnded).toBe(true));
+    children[0]!.emit("close", 0, null);
+    children[1]!.emit("close", 0, null);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(sink.writableFinished).toBe(false);
+    expect(sink.writableLength).toBe(1024);
+    expect(settled).toBe(false);
+    if (close) {
+      sink.destroy();
+      expect(await outcome).toBeInstanceOf(Error);
+      expect(await fs.readFile(path.join(destination, "preserve"), "utf8")).toBe("local");
+    } else {
+      release!();
+      expect(await outcome).toBeNull();
+      expect(sink.writableFinished).toBe(true);
+    }
+  } finally {
+    spy.mockRestore();
+    for (const child of children) {
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}, 3_000);
+
+realTarIt.each(["to", "from"] as const)("%s archive shell propagates SIGTERM and reaps its GNU tar worker", async (direction) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-signal-"));
+  const source = path.join(root, "source");
+  const destination = path.join(root, "destination");
+  const marker = path.join(root, "worker");
+  const action = path.join(root, "action.sh");
+  const previous = process.env.TAR_OPTIONS;
+  const { spawn: actualSpawn } = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+  const spy = vi.mocked(spawn).mockImplementation(((command: string, args: readonly string[], options: import("node:child_process").SpawnOptions) =>
+    command === "ssh" ? actualSpawn("sh", ["-c", String(args.at(-1))], { ...options, env: { ...process.env, TMPDIR: root } }) : actualSpawn(command, args, { ...options, env: { ...options.env, TMPDIR: root } })
+  ) as typeof spawn);
+  try {
+    await fs.mkdir(source);
+    await fs.mkdir(destination);
+    await fs.writeFile(path.join(source, "payload"), Buffer.alloc(256 * 1024));
+    await fs.writeFile(path.join(destination, "preserve"), "local");
+    await fs.writeFile(action, `#!/bin/sh\nif [ "$TAR_SUBCOMMAND" = "-c" ] && [ ! -e ${shellQuote(marker)} ]; then\n  printf '%s' "$PPID" > ${shellQuote(marker)}\n  set -- $(ps -o ppid= -p "$PPID")\n  kill -TERM "$1"\n  sleep 0.2\nfi\n`, { mode: 0o700 });
+    process.env.TAR_OPTIONS = `--checkpoint=1 '--checkpoint-action=exec=exec ${action}'`;
+    const spec = { host: "localhost", port: 22, username: "fixture", remoteCwd: root, remoteWorkspacePath: root, privateKey: null, knownHosts: null, strictHostKeyChecking: false } as const;
+    await expect(direction === "to"
+      ? syncDirectoryToSsh({ spec, localDir: source, remoteDir: destination })
+      : syncDirectoryFromSsh({ spec, remoteDir: source, localDir: destination })
+    ).rejects.toThrow();
+    const pid = Number(await fs.readFile(marker, "utf8"));
+    expect(() => process.kill(pid, 0)).toThrow();
+    expect((await fs.readdir(root)).filter((name) => name.startsWith("paperclip-ssh-members."))).toEqual([]);
+    if (direction === "from") expect(await fs.readFile(path.join(destination, "preserve"), "utf8")).toBe("local");
+  } finally {
+    if (previous === undefined) delete process.env.TAR_OPTIONS;
+    else process.env.TAR_OPTIONS = previous;
+    spy.mockRestore();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}, 5_000);
 
 realTarIt.each((["to", "from"] as const).flatMap((direction) =>
   ["", "a/b/c"].map((relative) => ({ direction, relative })),

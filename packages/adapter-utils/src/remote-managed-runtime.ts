@@ -147,6 +147,7 @@ export async function prepareRemoteManagedRuntime(input: {
     : null;
   const baselineSnapshot = preparedWorkspace
     ? await captureDirectorySnapshot(input.workspaceLocalDir, {
+        workspace: true,
         exclude: preparedWorkspace.gitBacked
           ? [...GIT_ARCHIVE_EXCLUDES, ".paperclip-runtime"]
           : [".paperclip-runtime", ...(input.workspaceFileMode === "all" ? input.workspaceExclude ?? [] : [])],

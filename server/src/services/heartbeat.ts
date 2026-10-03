@@ -2540,7 +2540,7 @@ async function materializeManagedProjectWorkspace(
       if (!snapshot) throw new Error("Configured repository folder is not a Git checkout");
       let baseline;
       try {
-        baseline = await captureDirectorySnapshot(cloneTmpDir, { exclude: [".git", ".paperclip-runtime", PROJECT_REPOSITORIES_DIR], ignoredPaths: snapshot.ignoredPaths, diskBacked: true });
+        baseline = await captureDirectorySnapshot(cloneTmpDir, { workspace: true, exclude: [".git", ".paperclip-runtime", PROJECT_REPOSITORIES_DIR], ignoredPaths: snapshot.ignoredPaths, diskBacked: true });
         await mergeDirectoryWithBaseline({ baseline, sourceDir: input.localSource, targetDir: cloneTmpDir });
       } finally {
         if (baseline) await disposeDirectorySnapshot(baseline);

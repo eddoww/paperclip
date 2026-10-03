@@ -1,6 +1,6 @@
 import { and, count, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -110,8 +110,23 @@ export async function observeCrossIssueInfluence(
     }
 
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
-    if (
+    let basis: "assignee" | "checkout" | null = null;
+    if (!sourceIssueId) {
+      // Unscoped run (e.g. heartbeat_timer): no source issue to compare against.
+      // Admit only writes to an issue this agent is assigned or this run has
+      // checked out; anything else stays fail-closed.
+      const target = await tx
+        .select({
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRunId: issues.checkoutRunId,
+        })
+        .from(issues)
+        .where(and(eq(issues.id, input.targetIssueId), eq(issues.companyId, input.companyId)))
+        .then((rows) => rows[0] ?? null);
+      if (target?.checkoutRunId === input.runId) basis = "checkout";
+      else if (target?.assigneeAgentId === input.agentId) basis = "assignee";
+      else throw crossIssueInfluenceRunContextError();
+    } else if (
       sourceIssueId === input.targetIssueId ||
       (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
     ) {
@@ -144,6 +159,7 @@ export async function observeCrossIssueInfluence(
       details: {
         kind: input.kind,
         sourceIssueId,
+        ...(basis ? { basis } : {}),
         targetIssueId: input.targetIssueId,
         targetIssueIdentifier: input.targetIssueIdentifier ?? null,
         count: decision.count,

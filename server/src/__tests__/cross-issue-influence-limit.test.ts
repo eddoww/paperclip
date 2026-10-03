@@ -10,6 +10,7 @@ import {
 function counterDb(
   initialCount = 0,
   runOverrides: Record<string, unknown> | null = {},
+  targetIssue: Record<string, unknown> | null = null,
 ) {
   let observedCount = initialCount;
   const inserted: Array<Record<string, unknown>> = [];
@@ -20,6 +21,11 @@ function counterDb(
           if (Object.keys(selection).includes("count")) {
             return {
               then: (resolve: (rows: unknown[]) => unknown) => resolve([{ count: observedCount }]),
+            };
+          }
+          if (Object.keys(selection).includes("checkoutRunId")) {
+            return {
+              then: (resolve: (rows: unknown[]) => unknown) => resolve(targetIssue ? [targetIssue] : []),
             };
           }
           return {
@@ -212,5 +218,81 @@ describe("cross-issue influence limit rollout", () => {
       details: { code: "cross_issue_influence_run_context_required" },
     });
     expect(fake.inserted).toEqual([]);
+  });
+
+  describe("unscoped runs (no source issue in the run context)", () => {
+    const base = {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      targetIssueIdentifier: "ELY-1",
+    } as const;
+    const otherAgent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const otherRun = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+    it.each(["comment", "update"] as const)(
+      "admits a %s on an issue assigned to the same agent and records a counted row",
+      async (kind) => {
+        const fake = counterDb(0, { contextSnapshot: {} }, {
+          assigneeAgentId: base.agentId,
+          checkoutRunId: null,
+        });
+
+        await expect(observeCrossIssueInfluence(fake.db as never, { ...base, kind }))
+          .resolves.toMatchObject({ allowed: true, count: 1 });
+        expect(fake.observedCount).toBe(1);
+        expect(fake.inserted).toEqual([
+          expect.objectContaining({
+            action: "issue.cross_issue_influence_observed",
+            details: expect.objectContaining({ kind, sourceIssueId: null, basis: "assignee" }),
+          }),
+        ]);
+      },
+    );
+
+    it("admits a write on an issue checked out by this run", async () => {
+      const fake = counterDb(0, { contextSnapshot: {} }, {
+        assigneeAgentId: otherAgent,
+        checkoutRunId: base.runId,
+      });
+
+      await expect(observeCrossIssueInfluence(fake.db as never, { ...base, kind: "comment" }))
+        .resolves.toMatchObject({ allowed: true, count: 1 });
+      expect(fake.inserted).toEqual([
+        expect.objectContaining({
+          details: expect.objectContaining({ sourceIssueId: null, basis: "checkout" }),
+        }),
+      ]);
+    });
+
+    it("still applies the per-run cap to admitted unscoped writes", async () => {
+      const fake = counterDb(CROSS_ISSUE_INFLUENCE_LIMIT, { contextSnapshot: {} }, {
+        assigneeAgentId: base.agentId,
+        checkoutRunId: null,
+      });
+
+      await expect(observeCrossIssueInfluence(fake.db as never, {
+        ...base,
+        kind: "comment",
+        now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+      })).resolves.toMatchObject({ allowed: false, count: CROSS_ISSUE_INFLUENCE_LIMIT + 1 });
+    });
+
+    it.each([
+      ["assigned to another agent", { assigneeAgentId: otherAgent, checkoutRunId: null }],
+      ["checked out by another run", { assigneeAgentId: otherAgent, checkoutRunId: otherRun }],
+      ["unassigned", { assigneeAgentId: null, checkoutRunId: null }],
+      ["missing", null],
+    ] as const)("keeps failing closed for an issue that is %s", async (_label, targetIssue) => {
+      const fake = counterDb(0, { contextSnapshot: {} }, targetIssue);
+
+      await expect(observeCrossIssueInfluence(fake.db as never, { ...base, kind: "comment" }))
+        .rejects.toMatchObject({
+          status: 403,
+          details: { code: "cross_issue_influence_run_context_required" },
+        });
+      expect(fake.inserted).toEqual([]);
+    });
   });
 });

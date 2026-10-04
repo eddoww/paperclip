@@ -27,8 +27,21 @@ jobs:
         with:
           node-version: '24'
 
+      - name: Check commitperclip key
+        id: key
+        run: |
+          if [ -z "$COMMITPERCLIP_KEY" ]; then
+            echo "COMMITPERCLIP_KEY is not configured on this repository; skipping commitperclip review."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          COMMITPERCLIP_KEY: ${{ secrets.COMMITPERCLIP_KEY }}
+
       - name: Generate commitperclip token
         id: token
+        if: steps.key.outputs.present == 'true'
         run: |
           TOKEN=$(node .github/scripts/get-bot-token.mjs)
           echo "::add-mask::$TOKEN"
@@ -38,7 +51,9 @@ jobs:
 
       - name: Run quality gates
         id: quality
-        if: github.event.pull_request.user.login != 'dependabot[bot]'
+        if: >-
+          steps.key.outputs.present == 'true' &&
+          github.event.pull_request.user.login != 'dependabot[bot]'
         run: node .github/scripts/run-quality-gates.mjs
         continue-on-error: true
         env:

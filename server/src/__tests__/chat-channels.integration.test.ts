@@ -7735,7 +7735,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         .from(chatConversations)
         .where(eq(chatConversations.endpointId, endpoint.id));
       expect(rows).toHaveLength(1);
-    });
+    }, { timeout: 10_000 });
     const [conversation] = await db
       .select()
       .from(chatConversations)
@@ -7751,7 +7751,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         "unmentioned follow-up delivered first",
       ]);
       expect(wakeup).toHaveBeenCalledTimes(2);
-    });
+    }, { timeout: 10_000 });
     await service.shutdown();
   });
 

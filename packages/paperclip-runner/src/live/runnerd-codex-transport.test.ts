@@ -7492,6 +7492,14 @@ it("preserves prepared input through runnerd and the real OpenCode proxy boundar
   await writeFile(proxy, proxyBytes, { mode: 0o755 });
   const digest = (file: string) => `sha256:${createHash("sha256").update(readFileSync(file)).digest("hex")}`;
   const runtime = join(root, "opencode");
+  // Hosted toolcache Node installs can be group-writable (umask 0002), which
+  // the qualified launch boundary rejects. Qualify a private copy in that case.
+  let providerNode = process.execPath;
+  if (((await stat(providerNode)).mode & 0o022) !== 0) {
+    providerNode = join(root, "node");
+    await cp(process.execPath, providerNode);
+    await chmod(providerNode, 0o755);
+  }
   const bundle = createCapabilityRunnerdCodexTransport({
     provider: "opencode",
     runnerBinary: defaultCapabilityRunnerdBinary(),
@@ -7501,8 +7509,8 @@ it("preserves prepared input through runnerd and the real OpenCode proxy boundar
     opencodeCommandSha256: digest(executable),
     opencodeProxyPath: proxy,
     opencodeProxySha256: digest(proxy),
-    providerNodeCommand: process.execPath,
-    providerNodeCommandSha256: digest(process.execPath),
+    providerNodeCommand: providerNode,
+    providerNodeCommandSha256: digest(providerNode),
     environment: { PATH: process.env.PATH, OPENROUTER_API_KEY: "fixture-key" },
   });
   const task = createCodexTaskEnvelope({

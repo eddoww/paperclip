@@ -34,6 +34,11 @@ export function crossIssueInfluenceRunContextError() {
   return forbidden(body.error, body.details);
 }
 
+export function crossIssueInfluenceTargetNotOwnedError() {
+  const { body } = issueWriteDenialResponse("cross_issue_influence_target_not_owned");
+  return forbidden(body.error, body.details);
+}
+
 function readRunSourceIssueId(contextSnapshot: unknown) {
   if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
   const context = contextSnapshot as Record<string, unknown>;
@@ -125,7 +130,7 @@ export async function observeCrossIssueInfluence(
         .then((rows) => rows[0] ?? null);
       if (target?.checkoutRunId === input.runId) basis = "checkout";
       else if (target?.assigneeAgentId === input.agentId) basis = "assignee";
-      else throw crossIssueInfluenceRunContextError();
+      else throw crossIssueInfluenceTargetNotOwnedError();
     } else if (
       sourceIssueId === input.targetIssueId ||
       (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())

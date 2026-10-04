@@ -86,6 +86,14 @@ describe("describeIssueWriteDenial", () => {
     expect(copy.sanctionedPath).toContain("PAPERCLIP_RUN_ID");
   });
 
+  it("tells the agent a valid run does not own the target, without asking for the run header", () => {
+    const copy = describeIssueWriteDenial("cross_issue_influence_target_not_owned");
+    expect(copy.status).toBe(403);
+    expect(copy.title).toContain("assigned to you or checked out by this run");
+    expect(copy.description).not.toContain("without a valid run");
+    expect(copy.sanctionedPath).not.toContain("X-Paperclip-Run-Id");
+  });
+
   it("tells a spoof attempt that the write itself was fine", () => {
     const copy = describeIssueWriteDenial("issue_write_attribution_spoof_rejected", {
       actorLabel: "Fable",

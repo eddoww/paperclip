@@ -168,7 +168,7 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
     await expect(observeCrossIssueInfluence(db, { ...base, targetIssueId: foreignIssueId }))
       .rejects.toMatchObject({
         status: 403,
-        details: { code: "cross_issue_influence_run_context_required" },
+        details: { code: "cross_issue_influence_target_not_owned" },
       });
 
     const recorded = await db

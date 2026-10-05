@@ -591,6 +591,36 @@ describe("ssh env-lab fixture", () => {
     expect(last.doneMb).toBe(last.totalMb);
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
+  it("excludes root and deeply nested transient paths from SSH tar in both directions", async () => {
+    const rootDir = await createFixtureRootDir();
+    const started = await startSshEnvLabFixtureOrSkip(path.join(rootDir, "state.json"), "SSH transient tar test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+    const localDir = path.join(rootDir, "local");
+    const restoreDir = path.join(rootDir, "restore");
+    const remoteDir = path.join(started.workspaceDir, "transient-source");
+    const transient = [".git/lfs/tmp", "repos/deep/project/.git/lfs/tmp", ".paperclip-merge-root", "repos/deep/project/.paperclip-merge-nested"];
+    const preserved = [".git/HEAD", ".git/objects/ab/history", ".git/lfs/objects/ab/object", "repos/deep/project/.git/lfs/objects/ab/object", "images/photo.png"];
+    for (const dir of [localDir, remoteDir]) {
+      for (const relative of preserved) {
+        await mkdir(path.dirname(path.join(dir, relative)), { recursive: true });
+        await writeFile(path.join(dir, relative), "keep");
+      }
+      for (const relative of transient) {
+        await mkdir(path.join(dir, relative), { recursive: true });
+        await writeFile(path.join(dir, relative, "volatile"), "volatile");
+      }
+    }
+    const uploadDir = path.join(started.workspaceDir, "transient-upload");
+    await syncDirectoryToSsh({ spec, localDir, remoteDir: uploadDir, exclude: [] });
+    await syncDirectoryFromSsh({ spec, remoteDir, localDir: restoreDir, exclude: [] });
+    for (const dir of [uploadDir, restoreDir]) {
+      for (const relative of transient) await expect(stat(path.join(dir, relative))).rejects.toMatchObject({ code: "ENOENT" });
+      for (const relative of preserved) expect(await readFile(path.join(dir, relative), "utf8")).toBe("keep");
+    }
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
   it("reports restore progress with a terminal completion line", async () => {
     const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");

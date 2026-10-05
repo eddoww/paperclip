@@ -4,7 +4,8 @@ import { constants as fsConstants, createReadStream, createWriteStream, promises
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { Transform } from "node:stream";
+import { Transform, pipeline } from "node:stream";
+import { shouldExcludePath, TRANSIENT_WORKSPACE_EXCLUDES } from "./exclude-patterns.js";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
 import {
   createUnrelatedHistoryGraftCommit,
@@ -409,8 +410,33 @@ async function createSshAuthArgs(
 }
 
 function tarExcludeArgs(exclude: string[] | undefined): string[] {
-  const combined = ["._*", ...(exclude ?? [])];
+  const combined = ["._*", ...TRANSIENT_WORKSPACE_EXCLUDES, ...(exclude ?? [])];
   return combined.flatMap((entry) => ["--exclude", entry]);
+}
+
+function directoryArchiveScript(input: { exclude?: string[]; followSymlinks?: boolean }): string {
+  const patterns = ["._*", ...TRANSIENT_WORKSPACE_EXCLUDES, ...(input.exclude ?? [])];
+  const predicates = patterns.flatMap((pattern, index) => [
+    ...(index > 0 ? ["-o"] : []),
+    ...(pattern.startsWith("./")
+      ? ["-path", shellQuote(`./${pattern.replace(/^(\.\/)+/, "")}`)]
+      : pattern.includes("/")
+        ? ["-path", shellQuote(`./${pattern}`), "-o", "-path", shellQuote(`*/${pattern}`)]
+        : ["-name", shellQuote(pattern)]),
+  ]).join(" ");
+  return [
+    'members=$(mktemp "${TMPDIR:-/tmp}/paperclip-ssh-members.XXXXXX") || exit',
+    'worker=',
+    'trap \'rm -f "$members"\' EXIT',
+    'terminate() { trap "" HUP INT TERM; if [ -n "$worker" ]; then kill -KILL "$worker" 2>/dev/null || :; wait "$worker" 2>/dev/null || :; fi; exit "$1"; }',
+    "trap 'terminate 129' HUP",
+    "trap 'terminate 130' INT",
+    "trap 'terminate 143' TERM",
+    'members_dir=$(CDPATH= cd -- "$(dirname -- "$members")" && pwd -P) || exit',
+    'members="$members_dir/$(basename -- "$members")"',
+    `find ${input.followSymlinks ? "-L " : ""}. \\( -samefile "$members" -o ${predicates} \\) -prune -o -print0 > "$members" & worker=$!; wait "$worker"; status=$?; worker=; [ "$status" -eq 0 ] || exit "$status"`,
+    `tar ${[...(input.followSymlinks ? ["-h"] : []), ...tarExcludeArgs(input.exclude).map(shellQuote), "--no-recursion", "--null", "-cf", "-", "-T", '"$members"'].join(" ")} & worker=$!; wait "$worker"; status=$?; worker=; exit "$status"`,
+  ].join("; ");
 }
 
 function tarSpawnEnv(): NodeJS.ProcessEnv {
@@ -442,6 +468,7 @@ async function estimateLocalDirSize(input: {
 }): Promise<number> {
   const regexes = ["._*", ...(input.exclude ?? [])].map(tarPatternToRegExp);
   const isExcluded = (relPath: string, base: string) =>
+    shouldExcludePath(relPath, TRANSIENT_WORKSPACE_EXCLUDES) ||
     regexes.some((regex) => regex.test(relPath) || regex.test(base));
 
   let total = 0;
@@ -604,6 +631,7 @@ async function copyDirectoryContents(sourceDir: string, targetDir: string): Prom
       recursive: true,
       force: true,
       preserveTimestamps: true,
+      verbatimSymlinks: true,
     });
   }));
 }
@@ -1328,7 +1356,7 @@ export async function syncDirectoryToSsh(input: {
     "-p",
     String(input.spec.port),
     `${input.spec.username}@${input.spec.host}`,
-    `sh -c ${shellQuote(`mkdir -p ${shellQuote(input.remoteDir)} && tar -xf - -C ${shellQuote(input.remoteDir)}`)}`,
+    `sh -c ${shellQuote(`mkdir -p ${shellQuote(input.remoteDir)} && tar -ixf - -C ${shellQuote(input.remoteDir)}`)}`,
   ];
 
   // tar's archive size isn't known until tar finishes, so estimate it from the
@@ -1352,16 +1380,8 @@ export async function syncDirectoryToSsh(input: {
 
   try {
     await new Promise<void>((resolve, reject) => {
-    const tarArgs = [
-      ...(input.followSymlinks ? ["-h"] : []),
-      "-C",
-      input.localDir,
-      ...tarExcludeArgs(input.exclude),
-      "-cf",
-      "-",
-      ".",
-    ];
-    const tar = spawn("tar", tarArgs, {
+    const tar = spawn("sh", ["-c", directoryArchiveScript(input)], {
+      cwd: input.localDir,
       stdio: ["ignore", "pipe", "pipe"],
       env: tarSpawnEnv(),
     });
@@ -1376,17 +1396,18 @@ export async function syncDirectoryToSsh(input: {
     let sshExited = false;
     let tarExitCode: number | null = null;
     let sshExitCode: number | null = null;
+    let pipeFinished = false;
 
     const maybeFinish = () => {
-      if (settled || !tarExited || !sshExited) {
+      if (settled || !tarExited || !sshExited || !pipeFinished) {
         return;
       }
       settled = true;
-      if ((tarExitCode ?? 0) !== 0) {
+      if (tarExitCode !== 0) {
         reject(new Error(tarStderr.trim() || `tar exited with code ${tarExitCode ?? -1}`));
         return;
       }
-      if ((sshExitCode ?? 0) !== 0) {
+      if (sshExitCode !== 0) {
         reject(new Error(sshStderr.trim() || `ssh exited with code ${sshExitCode ?? -1}`));
         return;
       }
@@ -1398,16 +1419,26 @@ export async function syncDirectoryToSsh(input: {
         return;
       }
       settled = true;
+      tar.stdout?.destroy();
+      ssh.stdin?.destroy();
+      progress?.counter.destroy();
       tar.kill("SIGTERM");
       ssh.kill("SIGTERM");
       reject(error);
     };
 
+    const onPipelineFinished = (error: NodeJS.ErrnoException | null) => {
+      if (error) {
+        fail(error);
+        return;
+      }
+      pipeFinished = true;
+      maybeFinish();
+    };
     if (progress) {
-      progress.counter.on("error", fail);
-      tar.stdout?.pipe(progress.counter).pipe(ssh.stdin ?? null);
+      pipeline(tar.stdout!, progress.counter, ssh.stdin!, onPipelineFinished);
     } else {
-      tar.stdout?.pipe(ssh.stdin ?? null);
+      pipeline(tar.stdout!, ssh.stdin!, onPipelineFinished);
     }
     tar.stderr?.on("data", (chunk) => {
       tarStderr += String(chunk);
@@ -1419,11 +1450,19 @@ export async function syncDirectoryToSsh(input: {
     tar.on("error", fail);
     ssh.on("error", fail);
     tar.on("close", (code) => {
+      if (code !== 0) {
+        fail(new Error(tarStderr.trim() || `tar exited with code ${code ?? -1}`));
+        return;
+      }
       tarExited = true;
       tarExitCode = code;
       maybeFinish();
     });
     ssh.on("close", (code) => {
+      if (code !== 0) {
+        fail(new Error(sshStderr.trim() || `ssh exited with code ${code ?? -1}`));
+        return;
+      }
       sshExited = true;
       sshExitCode = code;
       maybeFinish();
@@ -1449,7 +1488,7 @@ export async function syncDirectoryFromSsh(input: {
   const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
   const remoteTarScript = [
     `cd ${shellQuote(input.remoteDir)}`,
-    `tar ${[...tarExcludeArgs(input.exclude).map(shellQuote), "-cf", "-", "."].join(" ")}`,
+    `( ${directoryArchiveScript(input)} )`,
   ].join(" && ");
   const sshArgs = [
     ...auth.args,
@@ -1479,7 +1518,7 @@ export async function syncDirectoryFromSsh(input: {
       const ssh = spawn("ssh", sshArgs, {
         stdio: ["ignore", "pipe", "pipe"],
       });
-      const tar = spawn("tar", ["-xf", "-", "-C", stagingDir], {
+      const tar = spawn("tar", ["-ixf", "-", "-C", stagingDir], {
         stdio: ["pipe", "ignore", "pipe"],
         env: tarSpawnEnv(),
       });
@@ -1491,15 +1530,16 @@ export async function syncDirectoryFromSsh(input: {
       let tarExited = false;
       let sshExitCode: number | null = null;
       let tarExitCode: number | null = null;
+      let pipeFinished = false;
 
       const maybeFinish = () => {
-        if (settled || !sshExited || !tarExited) return;
+        if (settled || !sshExited || !tarExited || !pipeFinished) return;
         settled = true;
-        if ((sshExitCode ?? 0) !== 0) {
+        if (sshExitCode !== 0) {
           reject(new Error(sshStderr.trim() || `ssh exited with code ${sshExitCode ?? -1}`));
           return;
         }
-        if ((tarExitCode ?? 0) !== 0) {
+        if (tarExitCode !== 0) {
           reject(new Error(tarStderr.trim() || `tar exited with code ${tarExitCode ?? -1}`));
           return;
         }
@@ -1509,16 +1549,26 @@ export async function syncDirectoryFromSsh(input: {
       const fail = (error: Error) => {
         if (settled) return;
         settled = true;
+        ssh.stdout?.destroy();
+        tar.stdin?.destroy();
+        progress?.counter.destroy();
         ssh.kill("SIGTERM");
         tar.kill("SIGTERM");
         reject(error);
       };
 
+      const onPipelineFinished = (error: NodeJS.ErrnoException | null) => {
+        if (error) {
+          fail(error);
+          return;
+        }
+        pipeFinished = true;
+        maybeFinish();
+      };
       if (progress) {
-        progress.counter.on("error", fail);
-        ssh.stdout?.pipe(progress.counter).pipe(tar.stdin ?? null);
+        pipeline(ssh.stdout!, progress.counter, tar.stdin!, onPipelineFinished);
       } else {
-        ssh.stdout?.pipe(tar.stdin ?? null);
+        pipeline(ssh.stdout!, tar.stdin!, onPipelineFinished);
       }
       ssh.stderr?.on("data", (chunk) => {
         sshStderr += String(chunk);
@@ -1530,11 +1580,19 @@ export async function syncDirectoryFromSsh(input: {
       ssh.on("error", fail);
       tar.on("error", fail);
       ssh.on("close", (code) => {
+        if (code !== 0) {
+          fail(new Error(sshStderr.trim() || `ssh exited with code ${code ?? -1}`));
+          return;
+        }
         sshExited = true;
         sshExitCode = code;
         maybeFinish();
       });
       tar.on("close", (code) => {
+        if (code !== 0) {
+          fail(new Error(tarStderr.trim() || `tar exited with code ${code ?? -1}`));
+          return;
+        }
         tarExited = true;
         tarExitCode = code;
         maybeFinish();

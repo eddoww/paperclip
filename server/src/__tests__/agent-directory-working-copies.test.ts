@@ -95,6 +95,24 @@ describe("persistent agent directories", () => {
     expect(await db.select().from(agentInstructionRevisions).where(eq(agentInstructionRevisions.agentId, agentId))).toHaveLength(0);
   });
 
+  it("persists allowed merge-note edits through local collect and release", async () => {
+    const filename = ".paperclip-merge-notes.md";
+    await agentFileStore(db).write({ ...target(), path: filename, bytes: Buffer.from("original notes"), baseHash: null }, board());
+    const first = await run();
+    expect(await fs.readFile(path.join(first.localRoot, filename), "utf8")).toBe("original notes");
+    await fs.writeFile(path.join(first.localRoot, filename), "edited notes");
+    expect(await copies.hasChanges({ companyId, runId: first.runId })).toBe(true);
+    expect((await copies.collectStopped({ companyId, runId: first.runId }))?.state).toBe("saved");
+    expect(await fs.readFile(path.join(root, filename), "utf8")).toBe("edited notes");
+    await copies.release(companyId, first.runId);
+    await expect(fs.stat(first.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    const next = await run();
+    expect(await fs.readFile(path.join(next.localRoot, filename), "utf8")).toBe("edited notes");
+    expect((await copies.collectStopped({ companyId, runId: next.runId }))?.state).toBe("unchanged");
+    await copies.release(companyId, next.runId);
+    expect(await fs.readFile(path.join(root, filename), "utf8")).toBe("edited notes");
+  });
+
   async function sparseFile(filename: string, size: number) {
     const handle = await fs.open(filename, "w");
     try { await handle.truncate(size); } finally { await handle.close(); }

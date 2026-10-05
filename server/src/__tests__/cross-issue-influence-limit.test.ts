@@ -204,7 +204,7 @@ describe("cross-issue influence limit rollout", () => {
     expect(fake.inserted).toEqual([]);
   });
 
-  it("fails closed when the persisted run has no source issue", async () => {
+  it("fails closed with target_not_owned when the unscoped run does not own the target", async () => {
     const fake = counterDb(0, { contextSnapshot: {} });
 
     await expect(observeCrossIssueInfluence(fake.db as never, {
@@ -215,7 +215,7 @@ describe("cross-issue influence limit rollout", () => {
       kind: "update",
     })).rejects.toMatchObject({
       status: 403,
-      details: { code: "cross_issue_influence_run_context_required" },
+      details: { code: "cross_issue_influence_target_not_owned" },
     });
     expect(fake.inserted).toEqual([]);
   });
@@ -290,7 +290,7 @@ describe("cross-issue influence limit rollout", () => {
       await expect(observeCrossIssueInfluence(fake.db as never, { ...base, kind: "comment" }))
         .rejects.toMatchObject({
           status: 403,
-          details: { code: "cross_issue_influence_run_context_required" },
+          details: { code: "cross_issue_influence_target_not_owned" },
         });
       expect(fake.inserted).toEqual([]);
     });

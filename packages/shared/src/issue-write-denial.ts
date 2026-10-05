@@ -31,6 +31,7 @@ export const ISSUE_WRITE_DENIAL_CODES = [
   "issue_write_assignee_run_lock",
   "cross_issue_influence_cap_exceeded",
   "cross_issue_influence_run_context_required",
+  "cross_issue_influence_target_not_owned",
   "issue_write_attribution_spoof_rejected",
 ] as const;
 
@@ -260,6 +261,25 @@ export function describeIssueWriteDenial(
           `Send the \`X-Paperclip-Run-Id\` header with your current run (\`$PAPERCLIP_RUN_ID\`) ` +
           `and retry.`,
 
+      };
+
+    case "cross_issue_influence_target_not_owned":
+      return {
+        code,
+        status: 403,
+        tone: "boundary",
+        boundary: "Run write scope",
+        title: "This run may only write to issues assigned to you or checked out by this run",
+        description:
+          `The request carried a valid run, but this run has no source issue and ${issue} ` +
+          `is neither assigned to ${actor} nor checked out by this run, so the write was ` +
+          `refused. Sending the run header again will not change the outcome.`,
+        whoCanAct:
+          `${assignee} on ${issue}, or ${actor} once ${issue} is assigned to it or checked ` +
+          `out by this run.`,
+        sanctionedPath:
+          `Comment or update only on issues assigned to you or checked out by this run, or ` +
+          `${CHILD_ISSUE_PATH}.`,
       };
 
     case "issue_write_attribution_spoof_rejected":

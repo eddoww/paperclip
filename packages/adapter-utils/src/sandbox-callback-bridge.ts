@@ -160,6 +160,8 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   // Issue lifecycle: read context, checkout, update, comment, document, release
   { method: "GET", path: /^\/api\/issues\/[^/]+$/ },
   { method: "GET", path: /^\/api\/issues\/[^/]+\/heartbeat-context$/ },
+  { method: "GET", path: /^\/api\/issues\/[^/]+\/recovery-actions$/ },
+  { method: "POST", path: /^\/api\/issues\/[^/]+\/recovery-actions\/resolve$/ },
   { method: "GET", path: /^\/api\/issues\/[^/]+\/comments(?:\/[^/]+)?$/ },
   { method: "POST", path: /^\/api\/issues\/[^/]+\/comments$/ },
   { method: "GET", path: /^\/api\/issues\/[^/]+\/documents(?:\/[^/]+)?$/ },

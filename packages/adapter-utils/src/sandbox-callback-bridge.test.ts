@@ -1525,6 +1525,32 @@ describe("sandbox callback bridge", () => {
     }
   });
 
+  it.each([
+    { method: "GET", path: "/api/issues/issue-1/recovery-actions" },
+    { method: "POST", path: "/api/issues/ELY-886/recovery-actions/resolve" },
+  ])("admits the exact recovery route $method $path on both transports", (request) => {
+    expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBeNull();
+    expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST)).toBeNull();
+  });
+
+  it.each([
+    { method: "POST", path: "/api/issues/issue-1/recovery-actions" },
+    { method: "GET", path: "/api/issues/issue-1/recovery-actions/resolve" },
+    { method: "PATCH", path: "/api/issues/issue-1/recovery-actions/resolve" },
+    { method: "DELETE", path: "/api/issues/issue-1/recovery-actions" },
+    { method: "GET", path: "/api/issues/issue-1/recovery-actions/action-1" },
+    { method: "POST", path: "/api/issues/issue-1/recovery-actions/action-1/resolve" },
+    { method: "POST", path: "/api/issues/issue-1/recovery-actions/resolve/extra" },
+    { method: "GET", path: "/api/issues/issue-1/recovery-actions/" },
+    { method: "GET", path: "/api/issues/issue-1/recovery-actions-other" },
+    { method: "GET", path: "/api/issues//recovery-actions" },
+    { method: "GET", path: "/api/companies/co-1/recovery-actions" },
+  ])("denies unsupported recovery route $method $path on both transports", (request) => {
+    const denial = `Route not allowed: ${request.method} ${request.path}`;
+    expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBe(denial);
+    expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST)).toBe(denial);
+  });
+
   it("admits listing, uploads and downloads on the default queue route list", () => {
     const attachmentRequests: Array<{ method: string; path: string }> = [
       { method: "GET", path: "/api/issues/issue-1/attachments" },

@@ -5196,7 +5196,10 @@ describe("sandbox adapter execution targets", () => {
     }
   }, 20000);
 
-  it("drops a header outside the allowlist on the host http2 forward path", async () => {
+  it.each([
+    { method: "GET", path: "/api/issues/issue-1/recovery-actions" },
+    { method: "POST", path: "/api/issues/issue-1/recovery-actions/resolve" },
+  ])("preserves host attribution for recovery forward $method $path", async (request) => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-http2-hdr-"));
     cleanupDirs.push(rootDir);
     const remoteCwd = path.join(rootDir, "workspace");
@@ -5232,10 +5235,10 @@ describe("sandbox adapter execution targets", () => {
       expect(bridge?.env.PAPERCLIP_API_BRIDGE_MODE).toBe("http2_v1");
       await waitForCondition(() => sessionRef.current !== null, "the http2 client session to open", 4000);
       const response = await http2TestRequest(sessionRef.current!, {
-        method: "GET",
-        path: "/api/agents/me",
+        ...request,
         headers: {
           authorization: `Bearer ${bridgeToken}`,
+          "x-paperclip-run-id": "spoofed-run",
           // An allowlisted header the host must keep.
           accept: "application/json",
           // A header outside the allowlist the host must drop.
@@ -5252,6 +5255,19 @@ describe("sandbox adapter execution targets", () => {
       // The host applied the real token and the run id in place of the frame values.
       expect(forwarded.auth).toBe("Bearer real-run-jwt");
       expect(forwarded.runId).toBe("run-hdr");
+      expect(forwarded.url).toBe(request.path);
+      for (const unsupported of [
+        { method: "POST", path: "/api/issues/issue-1/recovery-actions" },
+        { method: "GET", path: "/api/issues/issue-1/recovery-actions/resolve" },
+        { method: "POST", path: "/api/issues/issue-1/recovery-actions/resolve/extra" },
+      ]) {
+        const denied = await http2TestRequest(sessionRef.current!, {
+          ...unsupported,
+          headers: { authorization: `Bearer ${bridgeToken}` },
+        });
+        expect(denied.status).toBe(403);
+      }
+      expect(api.requests).toHaveLength(1);
     } finally {
       sessionRef.current?.close();
       await bridge?.stop();
